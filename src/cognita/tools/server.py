@@ -29,7 +29,9 @@ from cognita.search.service import SearchService
 from cognita.specialties.service import SpecialtyService
 from cognita.tools.schemas import (
     BookItem,
+    CoverageGapItem,
     ExpandedPassage,
+    GapAnalysisResult,
     PassageResult,
     ResearchReportResult,
     SpecialtyItem,
@@ -256,6 +258,31 @@ async def add_books_to_specialty(
     svc = await _specialty_service()
     specialty = await svc.add_books(user_id, specialty_id, book_ids)
     return _to_specialty_item(specialty)
+
+
+@mcp.tool()
+async def analyze_specialty_gaps(specialty_id: int, ctx) -> GapAnalysisResult:
+    """Audit a specialty's corpus coverage and report its blind spots.
+
+    Compares the specialty's books against its subject and returns the most
+    important topics it covers poorly or not at all, each with suggested reading
+    to fill the gap. Use this to advise the user on what to add to the library.
+    """
+    user_id = _user_id_from_context(ctx)
+    svc = await _research_service()
+    analysis = await svc.analyze_gaps(user_id, specialty_id)
+    return GapAnalysisResult(
+        specialty_id=analysis.specialty_id,
+        specialty_name=analysis.specialty_name,
+        summary=analysis.summary,
+        gaps=[
+            CoverageGapItem(
+                topic=g.topic, reason=g.reason, suggested_reading=g.suggested_reading
+            )
+            for g in analysis.gaps
+        ],
+        books_analyzed=analysis.books_analyzed,
+    )
 
 
 # ── Deep research — the agent-as-tool ─────────────────────────────────────────

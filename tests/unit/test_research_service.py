@@ -2,9 +2,14 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+from cognita.books.domain import Book, BookFormat, BookMetadata, BookStatus, TocEntry
 from cognita.chunks.domain import Chunk, ChunkLevel, ChunkLocation, Citation
-from cognita.research.service import ResearchService, _merge_findings
+from cognita.core.exceptions import ConflictError
+from cognita.research.service import ResearchService, _book_outline, _merge_findings
 from cognita.search.domain import SearchResponse, SearchResult
+from cognita.specialties.domain import Specialty
 
 
 def _make_result(chunk_id: int, score: float, text: str = "passage text") -> SearchResult:
@@ -104,6 +109,88 @@ async def test_plan_failure_falls_back_to_raw_question():
 
     assert report.sub_queries == ["Question?"]
     assert report.answer == "Synthesized answer [1]."
+
+
+def _make_book(
+    book_id: int, title: str, author: str | None = None, chapters: list[str] | None = None
+) -> Book:
+    return Book(
+        id=book_id, user_id="u", status=BookStatus.READY, format=BookFormat.EPUB,
+        storage_path="x", file_size_bytes=1,
+        metadata=BookMetadata(title=title, author=author),
+        toc=[
+            TocEntry(title=t, level=1, sequence=i)
+            for i, t in enumerate(chapters or [])
+        ],
+    )
+
+
+def _make_gap_service(llm_response: dict) -> ResearchService:
+    svc = ResearchService(MagicMock(), llm_json=AsyncMock(return_value=llm_response))
+    svc._specialties = AsyncMock()
+    svc._specialties.get.return_value = Specialty(
+        id=7, user_id="u", name="Stoic Philosophy",
+        description="Stoicism corpus", persona=None, book_ids=[1, 2],
+    )
+    svc._books = AsyncMock()
+    svc._books.get.side_effect = [
+        _make_book(1, "Meditations", "Marcus Aurelius", ["On Anger", "On Death"]),
+        _make_book(2, "Letters", "Seneca"),
+    ]
+    return svc
+
+
+def test_book_outline_includes_author_and_chapters():
+    book = _make_book(1, "Meditations", "Marcus Aurelius", ["On Anger", "On Death"])
+    outline = _book_outline(book)
+    assert outline == "- Meditations — Marcus Aurelius (contents: On Anger; On Death)"
+
+
+async def test_analyze_gaps_builds_report():
+    svc = _make_gap_service({
+        "summary": "Coverage is strong on ethics but weak on physics.",
+        "gaps": [
+            {"topic": "Stoic physics", "reason": "No coverage", "suggested_reading": ["Hahm"]},
+        ],
+    })
+
+    analysis = await svc.analyze_gaps("u", 7)
+
+    assert analysis.specialty_name == "Stoic Philosophy"
+    assert analysis.books_analyzed == 2
+    assert analysis.summary.startswith("Coverage is strong")
+    assert [g.topic for g in analysis.gaps] == ["Stoic physics"]
+    assert analysis.gaps[0].suggested_reading == ["Hahm"]
+    # the corpus outline is included in the LLM prompt
+    prompt = svc._llm_json.call_args.args[0]
+    assert "Meditations — Marcus Aurelius" in prompt
+    assert "Stoic Philosophy" in prompt
+
+
+async def test_analyze_gaps_empty_specialty_raises():
+    svc = _make_gap_service({"summary": "", "gaps": []})
+    svc._specialties.get.return_value = Specialty(
+        id=7, user_id="u", name="Empty", book_ids=[],
+    )
+    with pytest.raises(ConflictError):
+        await svc.analyze_gaps("u", 7)
+
+
+async def test_analyze_gaps_skips_malformed_entries():
+    svc = _make_gap_service({
+        "summary": "ok",
+        "gaps": [
+            {"topic": "Valid gap", "reason": "r", "suggested_reading": ["Book", 42]},
+            {"reason": "missing topic"},
+            "not a dict",
+            {"topic": "   "},
+        ],
+    })
+
+    analysis = await svc.analyze_gaps("u", 7)
+
+    assert [g.topic for g in analysis.gaps] == ["Valid gap"]
+    assert analysis.gaps[0].suggested_reading == ["Book"]
 
 
 async def test_deep_research_uses_specialty_scope_and_name():

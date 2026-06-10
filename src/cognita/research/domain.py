@@ -16,6 +16,26 @@ class ResearchFinding:
 
 
 @dataclass
+class CoverageGap:
+    """A topic the specialty's corpus covers poorly or not at all."""
+
+    topic: str
+    reason: str
+    suggested_reading: list[str] = field(default_factory=list)
+
+
+@dataclass
+class GapAnalysis:
+    """Coverage audit of a specialty's corpus against its subject."""
+
+    specialty_id: int
+    specialty_name: str
+    summary: str
+    gaps: list[CoverageGap] = field(default_factory=list)
+    books_analyzed: int = 0
+
+
+@dataclass
 class ResearchReport:
     """The synthesized output of a deep_research run."""
 

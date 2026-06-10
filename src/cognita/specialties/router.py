@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 
 from cognita.auth.dependencies import get_current_user_id
 from cognita.core.exceptions import ConflictError, NotFoundError
 from cognita.infrastructure.database import get_pool
+from cognita.research.service import ResearchService
 from cognita.specialties.domain import Specialty
 from cognita.specialties.schemas import (
     SpecialtyBooksInput,
@@ -130,3 +132,47 @@ async def remove_book(
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return _to_response(specialty)
+
+
+def _get_research_service(pool=Depends(get_pool)) -> ResearchService:
+    return ResearchService(pool)
+
+
+class CoverageGapResponse(BaseModel):
+    topic: str
+    reason: str
+    suggested_reading: list[str]
+
+
+class GapAnalysisResponse(BaseModel):
+    specialty_id: int
+    specialty_name: str
+    summary: str
+    gaps: list[CoverageGapResponse]
+    books_analyzed: int
+
+
+@router.post("/{specialty_id}/gap-analysis", response_model=GapAnalysisResponse)
+async def analyze_gaps(
+    specialty_id: int,
+    user_id: str = Depends(get_current_user_id),
+    svc: ResearchService = Depends(_get_research_service),
+):
+    try:
+        analysis = await svc.analyze_gaps(user_id, specialty_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return GapAnalysisResponse(
+        specialty_id=analysis.specialty_id,
+        specialty_name=analysis.specialty_name,
+        summary=analysis.summary,
+        gaps=[
+            CoverageGapResponse(
+                topic=g.topic, reason=g.reason, suggested_reading=g.suggested_reading
+            )
+            for g in analysis.gaps
+        ],
+        books_analyzed=analysis.books_analyzed,
+    )

@@ -61,6 +61,10 @@ class AddBooksToSpecialtyInput(BaseModel):
     book_ids: list[int] = Field(..., min_length=1, description="Book IDs to add")
 
 
+class AnalyzeSpecialtyGapsInput(BaseModel):
+    specialty_id: int = Field(..., description="Specialty ID from list_specialties")
+
+
 class DeepResearchInput(BaseModel):
     question: str = Field(..., description="The research question to investigate")
     specialty_id: int | None = Field(
@@ -128,6 +132,20 @@ class SpecialtyItem(BaseModel):
     persona: str | None
     book_ids: list[int]
     book_count: int
+
+
+class CoverageGapItem(BaseModel):
+    topic: str
+    reason: str
+    suggested_reading: list[str]   # well-known works that would fill the gap
+
+
+class GapAnalysisResult(BaseModel):
+    specialty_id: int
+    specialty_name: str
+    summary: str                   # one-paragraph assessment of overall coverage
+    gaps: list[CoverageGapItem]    # most important first
+    books_analyzed: int
 
 
 class ResearchReportResult(BaseModel):

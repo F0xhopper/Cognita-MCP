@@ -11,10 +11,13 @@ from collections.abc import Awaitable, Callable
 
 import asyncpg
 
+from cognita.books.domain import Book
+from cognita.books.repository import BookRepository
 from cognita.core.config import settings
+from cognita.core.exceptions import ConflictError
 from cognita.core.logging import get_logger
 from cognita.infrastructure.mistral import chat_json, chat_text
-from cognita.research.domain import ResearchFinding, ResearchReport
+from cognita.research.domain import CoverageGap, GapAnalysis, ResearchFinding, ResearchReport
 from cognita.search.domain import SearchResult
 from cognita.search.service import SearchService
 from cognita.specialties.service import SpecialtyService
@@ -50,6 +53,27 @@ follow-up search queries targeting the gaps. If coverage is sufficient, return a
 
 Respond with JSON only: {{"queries": ["..."]}}"""
 
+_MAX_GAPS = 8
+
+_GAP_ANALYSIS_PROMPT = """\
+You are auditing the coverage of a curated book collection meant to support
+expert-level research on a subject.
+
+Subject: {subject}
+{description_line}
+
+Current collection:
+{outline}
+
+Identify the most important topics within the subject that this collection covers
+poorly or not at all. Focus on substantive blind spots a researcher would hit, not
+minor omissions. For each gap, suggest 1-3 well-known works that would fill it.
+
+Respond with JSON only:
+{{"summary": "<one-paragraph assessment of overall coverage>",
+  "gaps": [{{"topic": "...", "reason": "...", "suggested_reading": ["..."]}}]}}
+List at most {max_gaps} gaps, most important first."""
+
 _SYNTHESIS_PROMPT = """\
 Answer the research question using ONLY the numbered passages below.
 Cite every claim with inline markers like [1] or [2][5] referring to passage numbers.
@@ -71,6 +95,7 @@ class ResearchService:
     ) -> None:
         self._search = SearchService(pool)
         self._specialties = SpecialtyService(pool)
+        self._books = BookRepository(pool)
         self._llm_json = llm_json
         self._llm_text = llm_text
 
@@ -119,6 +144,56 @@ class ResearchService:
             sub_queries=queries,
             specialty_name=specialty_name,
             findings=numbered,
+        )
+
+    async def analyze_gaps(self, user_id: str, specialty_id: int) -> GapAnalysis:
+        """Audit a specialty's corpus and report what it covers poorly or not at all.
+
+        Builds an outline of the specialty's books (titles, authors, top-level
+        chapters) and asks the LLM to identify substantive blind spots, each with
+        suggested reading to fill it.
+        """
+        specialty = await self._specialties.get(user_id, specialty_id)
+        if not specialty.book_ids:
+            raise ConflictError(
+                f"Specialty '{specialty.name}' has no books — add books before analyzing gaps"
+            )
+
+        books: list[Book] = []
+        for book_id in specialty.book_ids:
+            book = await self._books.get(book_id, user_id)
+            if book is not None:
+                books.append(book)
+
+        description_line = (
+            f"Description: {specialty.description}" if specialty.description else ""
+        )
+        prompt = _GAP_ANALYSIS_PROMPT.format(
+            subject=specialty.name,
+            description_line=description_line,
+            outline="\n".join(_book_outline(b) for b in books),
+            max_gaps=_MAX_GAPS,
+        )
+        data = await self._llm_json(prompt, system=specialty.persona or _DEFAULT_PERSONA)
+
+        gaps: list[CoverageGap] = []
+        for g in data.get("gaps", []):
+            if not isinstance(g, dict) or not str(g.get("topic", "")).strip():
+                continue
+            reading = g.get("suggested_reading", [])
+            gaps.append(
+                CoverageGap(
+                    topic=str(g["topic"]).strip(),
+                    reason=str(g.get("reason", "")).strip(),
+                    suggested_reading=_clean_queries(reading if isinstance(reading, list) else []),
+                )
+            )
+        return GapAnalysis(
+            specialty_id=specialty.id,
+            specialty_name=specialty.name,
+            summary=str(data.get("summary", "")).strip(),
+            gaps=gaps[:_MAX_GAPS],
+            books_analyzed=len(books),
         )
 
     async def _plan_queries(self, question: str, persona: str, depth: int) -> list[str]:
@@ -188,6 +263,15 @@ class ResearchService:
 
 def _clean_queries(raw: list) -> list[str]:
     return [q.strip() for q in raw if isinstance(q, str) and q.strip()]
+
+
+def _book_outline(book: Book, max_chapters: int = 12) -> str:
+    meta = book.metadata
+    line = f"- {meta.title}" + (f" — {meta.author}" if meta.author else "")
+    chapters = [e.title for e in book.toc if e.level == 1][:max_chapters]
+    if chapters:
+        line += f" (contents: {'; '.join(chapters)})"
+    return line
 
 
 def _merge_findings(
