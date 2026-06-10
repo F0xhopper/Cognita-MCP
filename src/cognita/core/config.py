@@ -24,6 +24,11 @@ class Settings:
     # Mistral AI
     MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "")
     MISTRAL_OCR_MODEL: str = os.getenv("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
+    MISTRAL_CHAT_MODEL: str = os.getenv("MISTRAL_CHAT_MODEL", "mistral-large-latest")
+
+    # Deep research
+    RESEARCH_TOP_K_PER_QUERY: int = int(os.getenv("RESEARCH_TOP_K_PER_QUERY", "6"))
+    RESEARCH_MAX_PASSAGES: int = int(os.getenv("RESEARCH_MAX_PASSAGES", "24"))
 
     # Redis / Celery
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")

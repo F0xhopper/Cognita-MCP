@@ -24,11 +24,15 @@ from cognita.core.config import settings
 from cognita.core.logging import get_logger, setup_logging
 from cognita.infrastructure.database import init_pool, get_pool
 from cognita.infrastructure.storage import storage
+from cognita.research.service import ResearchService
 from cognita.search.service import SearchService
+from cognita.specialties.service import SpecialtyService
 from cognita.tools.schemas import (
     BookItem,
     ExpandedPassage,
     PassageResult,
+    ResearchReportResult,
+    SpecialtyItem,
     TocItem,
 )
 
@@ -39,8 +43,12 @@ mcp = FastMCP(
     "Cognita MCP",
     instructions=(
         "You have access to the user's personal book library. "
-        "Use semantic_search as your primary tool. "
-        "Use get_passage_context to expand a hit for richer context before quoting. "
+        "For research questions, prefer deep_research — it plans queries, retrieves, "
+        "and returns a synthesized answer with citations in one call. "
+        "Use list_specialties to discover scoped experts (named slices of the library "
+        "with their own persona) and pass specialty_id to deep_research or semantic_search. "
+        "Use semantic_search for quick lookups and get_passage_context to expand a hit "
+        "for richer context before quoting. "
         "Always include the citation string when referencing content."
     ),
 )
@@ -66,6 +74,16 @@ async def _book_service() -> BookService:
 async def _search_service() -> SearchService:
     pool = await _get_pool()
     return SearchService(pool)
+
+
+async def _specialty_service() -> SpecialtyService:
+    pool = await _get_pool()
+    return SpecialtyService(pool)
+
+
+async def _research_service() -> ResearchService:
+    pool = await _get_pool()
+    return ResearchService(pool)
 
 
 # ── Context helper — MCP tools must know which user they're serving ───────────
@@ -169,17 +187,113 @@ async def semantic_search(
     query: str,
     ctx,
     book_ids: list[int] | None = None,
+    specialty_id: int | None = None,
     top_k: int = 10,
 ) -> list[PassageResult]:
     """Search the library using semantic similarity.
 
-    This is the primary retrieval tool. Returns ranked passages with citations.
-    Optionally restrict to specific book_ids.
+    This is the primary quick-retrieval tool. Returns ranked passages with citations.
+    Optionally restrict to specific book_ids, or pass specialty_id to search within
+    a specialty's books (use list_specialties to discover IDs).
     """
     user_id = _user_id_from_context(ctx)
+    if specialty_id is not None:
+        spec_svc = await _specialty_service()
+        _, book_ids = await spec_svc.resolve_scope(user_id, specialty_id, book_ids)
     svc = await _search_service()
     resp = await svc.search(user_id=user_id, query=query, book_ids=book_ids, top_k=top_k)
     return [_to_passage_result(r) for r in resp.results]
+
+
+# ── Specialties — scoped experts over slices of the library ──────────────────
+
+@mcp.tool()
+async def list_specialties(ctx) -> list[SpecialtyItem]:
+    """List the user's specialties — named expert scopes over subsets of the library.
+
+    Each specialty groups books around a subject and may carry a persona.
+    Pass its id as specialty_id to deep_research or semantic_search to consult
+    that expert specifically.
+    """
+    user_id = _user_id_from_context(ctx)
+    svc = await _specialty_service()
+    return [_to_specialty_item(s) for s in await svc.list_specialties(user_id)]
+
+
+@mcp.tool()
+async def create_specialty(
+    name: str,
+    ctx,
+    description: str | None = None,
+    persona: str | None = None,
+    book_ids: list[int] | None = None,
+) -> SpecialtyItem:
+    """Create a new specialty — a named expert scope over a subset of the library.
+
+    Provide a persona to shape how the expert answers (e.g. "You are an expert on
+    Stoic philosophy; prefer primary sources and cite precisely").
+    """
+    user_id = _user_id_from_context(ctx)
+    svc = await _specialty_service()
+    specialty = await svc.create(
+        user_id=user_id,
+        name=name,
+        description=description,
+        persona=persona,
+        book_ids=book_ids,
+    )
+    return _to_specialty_item(specialty)
+
+
+@mcp.tool()
+async def add_books_to_specialty(
+    specialty_id: int,
+    book_ids: list[int],
+    ctx,
+) -> SpecialtyItem:
+    """Add books to an existing specialty. Use list_books to find book IDs."""
+    user_id = _user_id_from_context(ctx)
+    svc = await _specialty_service()
+    specialty = await svc.add_books(user_id, specialty_id, book_ids)
+    return _to_specialty_item(specialty)
+
+
+# ── Deep research — the agent-as-tool ─────────────────────────────────────────
+
+@mcp.tool()
+async def deep_research(
+    question: str,
+    ctx,
+    specialty_id: int | None = None,
+    book_ids: list[int] | None = None,
+    depth: int = 2,
+) -> ResearchReportResult:
+    """Run multi-step research over the library and return a cited synthesis.
+
+    Plans focused sub-queries, retrieves passages for each, checks for coverage
+    gaps (depth >= 2), and synthesizes an answer in which every claim carries an
+    inline marker like [1] referring to the returned citations list.
+
+    Pass specialty_id to consult a specific expert scope (its books and persona).
+    Prefer this over manual semantic_search loops for substantive questions.
+    """
+    user_id = _user_id_from_context(ctx)
+    svc = await _research_service()
+    report = await svc.deep_research(
+        user_id=user_id,
+        question=question,
+        specialty_id=specialty_id,
+        book_ids=book_ids,
+        depth=depth,
+    )
+    return ResearchReportResult(
+        question=report.question,
+        answer=report.answer,
+        citations=report.citations,
+        sub_queries=report.sub_queries,
+        specialty_name=report.specialty_name,
+        passages=[_to_passage_result(f.result) for f in report.findings],
+    )
 
 
 @mcp.tool()
@@ -227,6 +341,17 @@ async def get_passage_by_location(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _to_specialty_item(s) -> SpecialtyItem:
+    return SpecialtyItem(
+        id=s.id,
+        name=s.name,
+        description=s.description,
+        persona=s.persona,
+        book_ids=s.book_ids,
+        book_count=s.book_count,
+    )
+
 
 def _to_passage_result(r) -> PassageResult:
     loc = r.chunk.location

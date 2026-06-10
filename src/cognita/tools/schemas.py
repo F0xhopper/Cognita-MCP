@@ -37,7 +37,41 @@ class SemanticSearchInput(BaseModel):
         None,
         description="Restrict search to specific book IDs. Omit to search entire library.",
     )
+    specialty_id: int | None = Field(
+        None,
+        description="Restrict search to a specialty's books. Use list_specialties to discover IDs.",
+    )
     top_k: int = Field(10, ge=1, le=50, description="Number of results to return")
+
+
+class CreateSpecialtyInput(BaseModel):
+    name: str = Field(
+        ..., min_length=1, max_length=200, description="Display name, e.g. 'Stoic Philosophy'"
+    )
+    description: str | None = Field(None, description="What this specialty covers")
+    persona: str | None = Field(
+        None,
+        description="Instruction block shaping how the expert answers, e.g. 'You are an expert…'",
+    )
+    book_ids: list[int] = Field(default_factory=list, description="Books to include initially")
+
+
+class AddBooksToSpecialtyInput(BaseModel):
+    specialty_id: int = Field(..., description="Specialty ID from list_specialties")
+    book_ids: list[int] = Field(..., min_length=1, description="Book IDs to add")
+
+
+class DeepResearchInput(BaseModel):
+    question: str = Field(..., description="The research question to investigate")
+    specialty_id: int | None = Field(
+        None,
+        description="Scope research to a specialty (its books and persona); omit for whole library",
+    )
+    book_ids: list[int] | None = Field(None, description="Restrict to specific book IDs")
+    depth: int = Field(
+        2, ge=1, le=3,
+        description="1 = single retrieval pass, 2-3 = wider plan plus gap-check follow-ups",
+    )
 
 
 class GetPassageContextInput(BaseModel):
@@ -85,3 +119,21 @@ class ExpandedPassage(BaseModel):
     full_text: str
     citation: str
     chunk_ids: list[int]   # ordered IDs of all chunks included in full_text
+
+
+class SpecialtyItem(BaseModel):
+    id: int
+    name: str
+    description: str | None
+    persona: str | None
+    book_ids: list[int]
+    book_count: int
+
+
+class ResearchReportResult(BaseModel):
+    question: str
+    answer: str                # cited prose; markers like [1] refer to entries in citations
+    citations: list[str]       # citations[n-1] corresponds to inline marker [n]
+    sub_queries: list[str]     # the search queries the agent ran
+    specialty_name: str | None
+    passages: list[PassageResult]  # the numbered passages backing the citations, in order

@@ -1,13 +1,18 @@
-"""Mistral AI integration for document parsing and OCR.
+"""Mistral AI integration for document parsing, OCR, and research synthesis.
 
 Used during ingestion to extract clean text from scanned PDFs and complex layouts.
 For well-formed digital PDFs, pypdf is used directly (cheaper, faster).
+Also provides chat helpers used by the deep-research agent.
 """
 
 import base64
+import json
 from pathlib import Path
 
-from mistralai import Mistral
+try:
+    from mistralai import Mistral
+except ImportError:  # mistralai >= 2 moved the client class
+    from mistralai.client import Mistral
 
 from cognita.core.config import settings
 from cognita.core.logging import get_logger
@@ -63,6 +68,35 @@ async def extract_structure(raw_text: str, title: str) -> dict:
         ],
         response_format={"type": "json_object"},
     )
-    import json
+    content = resp.choices[0].message.content or "{}"
+    return json.loads(content)
+
+
+async def chat_text(prompt: str, system: str | None = None) -> str:
+    """Single-turn chat completion returning plain text."""
+    client = get_mistral_client()
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    resp = await client.chat.complete_async(
+        model=settings.MISTRAL_CHAT_MODEL,
+        messages=messages,
+    )
+    return resp.choices[0].message.content or ""
+
+
+async def chat_json(prompt: str, system: str | None = None) -> dict:
+    """Single-turn chat completion constrained to a JSON object response."""
+    client = get_mistral_client()
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    resp = await client.chat.complete_async(
+        model=settings.MISTRAL_CHAT_MODEL,
+        messages=messages,
+        response_format={"type": "json_object"},
+    )
     content = resp.choices[0].message.content or "{}"
     return json.loads(content)
