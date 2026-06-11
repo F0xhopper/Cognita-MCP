@@ -28,7 +28,9 @@ from cognita.research.service import ResearchService
 from cognita.search.service import SearchService
 from cognita.specialties.service import SpecialtyService
 from cognita.tools.schemas import (
+    BookIngestResult,
     BookItem,
+    BookStatusResult,
     ExpandedPassage,
     PassageResult,
     ResearchReportResult,
@@ -256,6 +258,68 @@ async def add_books_to_specialty(
     svc = await _specialty_service()
     specialty = await svc.add_books(user_id, specialty_id, book_ids)
     return _to_specialty_item(specialty)
+
+
+# ── URL ingestion — self-bootstrapping ───────────────────────────────────────
+
+@mcp.tool()
+async def ingest_from_url(
+    url: str,
+    title: str,
+    ctx,
+    author: str | None = None,
+    year: int | None = None,
+    language: str = "en",
+) -> BookIngestResult:
+    """Download and ingest a document from a public URL (PDF, EPUB, or TXT).
+
+    The file is fetched server-side, parsed, embedded, and added to the library.
+    Ingestion runs in the background — call get_book_status(book_id) to poll until
+    status is 'ready', then the book is searchable. Max file size: 100 MB.
+
+    Useful for bootstrapping a specialty from freely available sources such as
+    Project Gutenberg (gutenberg.org) or Internet Archive (archive.org).
+    """
+    from cognita.ingestion.worker import ingest_book_task
+
+    user_id = _user_id_from_context(ctx)
+    svc = await _book_service()
+    book = await svc.ingest_from_url(
+        user_id=user_id,
+        url=url,
+        title=title,
+        author=author,
+        year=year,
+        language=language,
+    )
+    ingest_book_task.delay(book.id)
+    return BookIngestResult(
+        book_id=book.id,
+        title=book.metadata.title,
+        author=book.metadata.author,
+        status=str(book.status),
+        message=f"Ingestion started — poll get_book_status({book.id}) until status is 'ready'.",
+    )
+
+
+@mcp.tool()
+async def get_book_status(book_id: int, ctx) -> BookStatusResult:
+    """Check the ingestion status of a book.
+
+    Returns 'pending', 'processing', 'ready', or 'failed'.
+    Poll this after ingest_from_url until status is 'ready' before using the book
+    in semantic_search, deep_research, or adding it to a specialty.
+    """
+    user_id = _user_id_from_context(ctx)
+    svc = await _book_service()
+    book = await svc.get_book(user_id, book_id)
+    return BookStatusResult(
+        book_id=book.id,
+        title=book.metadata.title,
+        status=str(book.status),
+        chunk_count=book.chunk_count,
+        error_message=book.error_message,
+    )
 
 
 # ── Deep research — the agent-as-tool ─────────────────────────────────────────
