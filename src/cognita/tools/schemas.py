@@ -137,3 +137,19 @@ class ResearchReportResult(BaseModel):
     sub_queries: list[str]     # the search queries the agent ran
     specialty_name: str | None
     passages: list[PassageResult]  # the numbered passages backing the citations, in order
+
+
+class BookIngestResult(BaseModel):
+    book_id: int
+    title: str
+    author: str | None
+    status: str   # always "pending" on return — poll get_book_status until "ready"
+    message: str
+
+
+class BookStatusResult(BaseModel):
+    book_id: int
+    title: str
+    status: str          # pending | processing | ready | failed
+    chunk_count: int
+    error_message: str | None

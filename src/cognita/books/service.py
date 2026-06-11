@@ -1,6 +1,9 @@
-from fastapi import UploadFile
+from pathlib import Path
+from urllib.parse import urlparse
 
 import asyncpg
+import httpx
+from fastapi import UploadFile
 
 from cognita.books.domain import Book, BookFormat, BookMetadata, BookStatus, BookSummary
 from cognita.books.repository import BookRepository
@@ -56,6 +59,57 @@ class BookService:
         if book is None:
             raise NotFoundError("Book", book_id)
         return book
+
+    async def ingest_from_url(
+        self,
+        user_id: str,
+        url: str,
+        title: str,
+        author: str | None = None,
+        year: int | None = None,
+        language: str = "en",
+    ) -> Book:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                content_type = resp.headers.get("content-type", "")
+                declared_length = int(resp.headers.get("content-length", 0))
+                if declared_length > _MAX_FILE_SIZE:
+                    raise ValueError(f"Remote file exceeds {_MAX_FILE_SIZE // (1024 * 1024)} MB limit")
+                chunks: list[bytes] = []
+                downloaded = 0
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    downloaded += len(chunk)
+                    if downloaded > _MAX_FILE_SIZE:
+                        raise ValueError(f"Remote file exceeds {_MAX_FILE_SIZE // (1024 * 1024)} MB limit")
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+
+        filename = Path(urlparse(url).path).name or "download"
+        ext = Path(filename).suffix.lower()
+        if ext in _ALLOWED_EXTENSIONS:
+            fmt = _ALLOWED_EXTENSIONS[ext]
+        elif "pdf" in content_type:
+            fmt = BookFormat.PDF
+            if not ext:
+                filename += ".pdf"
+        elif "epub" in content_type:
+            fmt = BookFormat.EPUB
+            if not ext:
+                filename += ".epub"
+        else:
+            raise UnsupportedFormatError(content_type or ext or "unknown")
+
+        path = await storage().save(user_id, data, filename)
+        meta = BookMetadata(title=title, author=author, year=year, language=language)
+        return await self._repo.create(
+            user_id=user_id,
+            status=BookStatus.PENDING,
+            fmt=fmt,
+            storage_path=path,
+            file_size_bytes=len(data),
+            meta=meta,
+        )
 
     async def delete_book(self, user_id: str, book_id: int) -> None:
         book = await self._repo.get(book_id, user_id)
