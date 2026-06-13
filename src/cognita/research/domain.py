@@ -17,7 +17,7 @@ class ResearchFinding:
 
 @dataclass
 class ResearchReport:
-    """The synthesized output of a deep_research run."""
+    """The synthesized output of a specialist agent consultation."""
 
     question: str
     answer: str                          # cited prose, markers like [1] refer to citations

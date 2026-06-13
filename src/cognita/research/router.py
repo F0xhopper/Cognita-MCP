@@ -17,7 +17,6 @@ class ResearchRequest(BaseModel):
     question: str = Field(..., min_length=3)
     specialty_id: int | None = None
     book_ids: list[int] | None = None
-    depth: int = Field(2, ge=1, le=3)
 
 
 class ResearchFindingResponse(BaseModel):
@@ -39,18 +38,17 @@ class ResearchReportResponse(BaseModel):
 
 
 @router.post("/", response_model=ResearchReportResponse)
-async def deep_research(
+async def consult_specialist(
     req: ResearchRequest,
     user_id: str = Depends(get_current_user_id),
     svc: ResearchService = Depends(_get_service),
 ):
     try:
-        report = await svc.deep_research(
+        report = await svc.consult(
             user_id=user_id,
             question=req.question,
             specialty_id=req.specialty_id,
             book_ids=req.book_ids,
-            depth=req.depth,
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

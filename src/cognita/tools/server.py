@@ -18,13 +18,11 @@ import asyncpg
 from mcp.server.fastmcp import FastMCP
 
 from cognita.books.domain import BookMetadata, BookStatus
-from cognita.books.repository import BookRepository
 from cognita.books.service import BookService
-from cognita.core.exceptions import UnsupportedFormatError, UrlFetchError
-from cognita.ingestion.worker import ingest_book_task
 from cognita.core.config import settings
+from cognita.core.exceptions import UnsupportedFormatError, UrlFetchError
 from cognita.core.logging import get_logger, setup_logging
-from cognita.infrastructure.database import init_pool, get_pool
+from cognita.ingestion.pipeline import ingest_book
 from cognita.research.service import ResearchService
 from cognita.search.service import SearchService
 from cognita.specialties.service import SpecialtyService
@@ -44,12 +42,13 @@ mcp = FastMCP(
     "Cognita MCP",
     instructions=(
         "You have access to the user's personal book library. "
-        "For research questions, prefer deep_research — it plans queries, retrieves, "
-        "and returns a synthesized answer with citations in one call. "
-        "Use list_specialties to discover scoped experts (named slices of the library "
-        "with their own persona) and pass specialty_id to deep_research or semantic_search. "
-        "Use semantic_search for quick lookups and get_passage_context to expand a hit "
-        "for richer context before quoting. "
+        "Before answering any research question, call list_specialties first to check "
+        "if a relevant expert scope exists, then pass its specialty_id to consult_specialist. "
+        "Only skip this if the user specifies book_ids directly. "
+        "For research questions, always prefer consult_specialist — it runs a specialist agent "
+        "that autonomously searches, expands passages, and returns a synthesized cited answer. "
+        "Use semantic_search only for quick, direct lookups when the user wants a specific passage. "
+        "Use get_passage_context to expand a hit for richer context before quoting. "
         "Always include the citation string when referencing content."
     ),
 )
@@ -164,26 +163,6 @@ async def get_table_of_contents(book_id: int, ctx) -> list[TocItem]:
 
 
 @mcp.tool()
-async def get_chapter(book_id: int, chapter_n: int, ctx) -> list[PassageResult]:
-    """Retrieve all passages from a specific chapter."""
-    user_id = _user_id_from_context(ctx)
-    svc = await _search_service()
-    results = await svc.get_passage_by_location(user_id, book_id, chapter_n=chapter_n)
-    return [_to_passage_result(r) for r in results]
-
-
-@mcp.tool()
-async def get_section(book_id: int, chapter_n: int, section_n: int, ctx) -> list[PassageResult]:
-    """Retrieve passages from a specific section within a chapter."""
-    user_id = _user_id_from_context(ctx)
-    svc = await _search_service()
-    results = await svc.get_passage_by_location(
-        user_id, book_id, chapter_n=chapter_n, section_n=section_n
-    )
-    return [_to_passage_result(r) for r in results]
-
-
-@mcp.tool()
 async def semantic_search(
     query: str,
     ctx,
@@ -244,7 +223,7 @@ async def add_book_from_url(
     except UnsupportedFormatError as exc:
         raise ValueError(str(exc)) from exc
 
-    ingest_book_task.delay(book.id)
+    asyncio.create_task(ingest_book(book.id, await _get_pool()))
     return BookItem(
         id=book.id,
         title=book.metadata.title,
@@ -262,8 +241,7 @@ async def list_specialties(ctx) -> list[SpecialtyItem]:
     """List the user's specialties — named expert scopes over subsets of the library.
 
     Each specialty groups books around a subject and may carry a persona.
-    Pass its id as specialty_id to deep_research or semantic_search to consult
-    that expert specifically.
+    Pass its id as specialty_id to consult_specialist to engage that expert.
     """
     user_id = _user_id_from_context(ctx)
     svc = await _specialty_service()
@@ -308,33 +286,32 @@ async def add_books_to_specialty(
     return _to_specialty_item(specialty)
 
 
-# ── Deep research — the agent-as-tool ─────────────────────────────────────────
+# ── Specialist sub-agent ──────────────────────────────────────────────────────
 
 @mcp.tool()
-async def deep_research(
+async def consult_specialist(
     question: str,
     ctx,
     specialty_id: int | None = None,
     book_ids: list[int] | None = None,
-    depth: int = 2,
 ) -> ResearchReportResult:
-    """Run multi-step research over the library and return a cited synthesis.
+    """Delegate a research question to a specialist agent scoped to a specialty.
 
-    Plans focused sub-queries, retrieves passages for each, checks for coverage
-    gaps (depth >= 2), and synthesizes an answer in which every claim carries an
-    inline marker like [1] referring to the returned citations list.
+    The specialist autonomously searches the library, expands promising passages,
+    and synthesizes a cited answer in which every claim carries an inline marker
+    like [1] referring to the returned citations list.
 
-    Pass specialty_id to consult a specific expert scope (its books and persona).
-    Prefer this over manual semantic_search loops for substantive questions.
+    Pass specialty_id (from list_specialties) to consult a named expert — it will
+    apply that specialty's persona and restrict retrieval to its books.
+    Prefer this over manual semantic_search loops for any substantive question.
     """
     user_id = _user_id_from_context(ctx)
     svc = await _research_service()
-    report = await svc.deep_research(
+    report = await svc.consult(
         user_id=user_id,
         question=question,
         specialty_id=specialty_id,
         book_ids=book_ids,
-        depth=depth,
     )
     return ResearchReportResult(
         question=report.question,
@@ -373,23 +350,6 @@ async def get_passage_context(
     )
 
 
-@mcp.tool()
-async def get_passage_by_location(
-    book_id: int,
-    ctx,
-    chapter_n: int | None = None,
-    section_n: int | None = None,
-) -> list[PassageResult]:
-    """Retrieve passages by exact structural location (chapter/section numbers).
-
-    Use get_table_of_contents first to discover valid chapter_n and section_n values.
-    """
-    user_id = _user_id_from_context(ctx)
-    svc = await _search_service()
-    results = await svc.get_passage_by_location(user_id, book_id, chapter_n, section_n)
-    return [_to_passage_result(r) for r in results]
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _to_specialty_item(s) -> SpecialtyItem:
@@ -424,5 +384,4 @@ def run() -> None:
         mcp.run(transport="stdio")
     else:
         import uvicorn
-        sse_app = mcp.get_asgi_app()
-        uvicorn.run(sse_app, host=settings.HOST, port=settings.MCP_PORT)
+        uvicorn.run(mcp.sse_app(), host=settings.HOST, port=settings.MCP_PORT)

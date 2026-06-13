@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
@@ -13,7 +14,7 @@ from cognita.books.schemas import (
 from cognita.books.service import BookService
 from cognita.core.exceptions import NotFoundError, UnsupportedFormatError, UrlFetchError
 from cognita.infrastructure.database import get_pool
-from cognita.ingestion.worker import ingest_book_task
+from cognita.ingestion.pipeline import ingest_book
 
 router = APIRouter(prefix="/books", tags=["books"])
 
@@ -59,6 +60,7 @@ async def upload_book(
     metadata: str = Form(..., description="JSON-encoded BookMetadataInput"),
     user_id: str = Depends(get_current_user_id),
     svc: BookService = Depends(_get_service),
+    pool=Depends(get_pool),
 ):
     try:
         meta_dict = json.loads(metadata)
@@ -73,7 +75,7 @@ async def upload_book(
     except ValueError as exc:
         raise HTTPException(status_code=413, detail=str(exc))
 
-    ingest_book_task.delay(book.id)
+    asyncio.create_task(ingest_book(book.id, pool))
     return BookSummaryResponse(
         id=book.id, title=book.metadata.title, author=book.metadata.author,
         status=book.status, format=book.format, chunk_count=0, created_at=book.created_at,
@@ -85,6 +87,7 @@ async def add_book_from_url(
     body: AddBookFromUrlRequest,
     user_id: str = Depends(get_current_user_id),
     svc: BookService = Depends(_get_service),
+    pool=Depends(get_pool),
 ):
     meta = BookMetadata(
         title=body.metadata.title,
@@ -103,7 +106,7 @@ async def add_book_from_url(
     except UnsupportedFormatError as exc:
         raise HTTPException(status_code=415, detail=str(exc))
 
-    ingest_book_task.delay(book.id)
+    asyncio.create_task(ingest_book(book.id, pool))
     return BookSummaryResponse(
         id=book.id, title=book.metadata.title, author=book.metadata.author,
         status=book.status, format=book.format, chunk_count=0, created_at=book.created_at,
