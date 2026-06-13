@@ -5,10 +5,14 @@ from cognita.core.exceptions import ConflictError, NotFoundError
 from cognita.infrastructure.database import get_pool
 from cognita.specialties.domain import Specialty
 from cognita.specialties.schemas import (
+    CorpusConfirmInput,
+    CorpusStatusResponse,
     SpecialtyBooksInput,
     SpecialtyCreateInput,
+    SpecialtyCreateResponse,
     SpecialtyResponse,
     SpecialtyUpdateInput,
+    SuggestedSourceResponse,
 )
 from cognita.specialties.service import SpecialtyService
 
@@ -32,6 +36,31 @@ def _to_response(s: Specialty) -> SpecialtyResponse:
     )
 
 
+def _to_create_response(s: Specialty) -> SpecialtyCreateResponse:
+    return SpecialtyCreateResponse(
+        id=s.id,
+        name=s.name,
+        description=s.description,
+        persona=s.persona,
+        book_ids=s.book_ids,
+        book_count=s.book_count,
+        created_at=s.created_at,
+        updated_at=s.updated_at,
+        suggestions=[
+            SuggestedSourceResponse(
+                title=item.title,
+                author=item.author,
+                tier=item.tier,
+                rationale=item.rationale,
+                source_url=item.source_url,
+                source_type=item.source_type,
+                approved=item.approved,
+            )
+            for item in s.pending_corpus
+        ],
+    )
+
+
 @router.get("/", response_model=list[SpecialtyResponse])
 async def list_specialties(
     user_id: str = Depends(get_current_user_id),
@@ -40,7 +69,7 @@ async def list_specialties(
     return [_to_response(s) for s in await svc.list_specialties(user_id)]
 
 
-@router.post("/", response_model=SpecialtyResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=SpecialtyCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_specialty(
     req: SpecialtyCreateInput,
     user_id: str = Depends(get_current_user_id),
@@ -52,13 +81,10 @@ async def create_specialty(
             name=req.name,
             description=req.description,
             persona=req.persona,
-            book_ids=req.book_ids,
         )
     except ConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except NotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return _to_response(specialty)
+    return _to_create_response(specialty)
 
 
 @router.get("/{specialty_id}", response_model=SpecialtyResponse)
@@ -100,6 +126,38 @@ async def delete_specialty(
 ):
     try:
         await svc.delete(user_id, specialty_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{specialty_id}/corpus/confirm", response_model=SpecialtyResponse)
+async def confirm_corpus(
+    specialty_id: int,
+    req: CorpusConfirmInput,
+    user_id: str = Depends(get_current_user_id),
+    svc: SpecialtyService = Depends(_get_service),
+):
+    try:
+        specialty = await svc.confirm_corpus(
+            user_id=user_id,
+            specialty_id=specialty_id,
+            approved_indices=req.approved_indices,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _to_response(specialty)
+
+
+@router.get("/{specialty_id}/corpus-status", response_model=CorpusStatusResponse)
+async def corpus_status(
+    specialty_id: int,
+    user_id: str = Depends(get_current_user_id),
+    svc: SpecialtyService = Depends(_get_service),
+):
+    try:
+        return await svc.corpus_status(user_id=user_id, specialty_id=specialty_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

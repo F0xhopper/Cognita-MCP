@@ -53,7 +53,14 @@ class CreateSpecialtyInput(BaseModel):
         None,
         description="Instruction block shaping how the expert answers, e.g. 'You are an expert…'",
     )
-    book_ids: list[int] = Field(default_factory=list, description="Books to include initially")
+
+
+class ConfirmCorpusInput(BaseModel):
+    specialty_id: int = Field(..., description="Specialty ID returned by create_specialty")
+    approved_indices: list[int] = Field(
+        ...,
+        description="Indices from the suggestions list to approve and ingest",
+    )
 
 
 class AddBooksToSpecialtyInput(BaseModel):
@@ -121,6 +128,17 @@ class ExpandedPassage(BaseModel):
     chunk_ids: list[int]   # ordered IDs of all chunks included in full_text
 
 
+class CorpusSuggestionItem(BaseModel):
+    index: int              # pass this in approved_indices to confirm_corpus
+    title: str
+    author: str
+    tier: str               # primary | commentary | competing | synthesis
+    rationale: str
+    source_url: str | None
+    source_type: str        # gutenberg | archive_org | user_upload_required
+    approved: bool          # pre-selected default; user should review
+
+
 class SpecialtyItem(BaseModel):
     id: int
     name: str
@@ -128,6 +146,17 @@ class SpecialtyItem(BaseModel):
     persona: str | None
     book_ids: list[int]
     book_count: int
+
+
+class SpecialtyWithSuggestionsItem(SpecialtyItem):
+    """Returned by create_specialty — includes suggested corpus for user review.
+
+    Present the suggestions to the user; they approve or reject each one.
+    Then call confirm_corpus with the approved indices to start ingestion.
+    Items with source_type='user_upload_required' have no URL and must be
+    uploaded manually via add_book_from_url after the user locates a copy.
+    """
+    suggestions: list[CorpusSuggestionItem]
 
 
 class ResearchReportResult(BaseModel):

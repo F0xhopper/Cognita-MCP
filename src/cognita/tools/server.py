@@ -28,10 +28,12 @@ from cognita.search.service import SearchService
 from cognita.specialties.service import SpecialtyService
 from cognita.tools.schemas import (
     BookItem,
+    CorpusSuggestionItem,
     ExpandedPassage,
     PassageResult,
     ResearchReportResult,
     SpecialtyItem,
+    SpecialtyWithSuggestionsItem,
     TocItem,
 )
 
@@ -62,7 +64,9 @@ async def _get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
         ssl = "require" if settings.DATABASE_SSL else None
-        _pool = await asyncpg.create_pool(settings.DATABASE_URL, min_size=2, max_size=5, ssl=ssl)
+        _pool = await asyncpg.create_pool(
+            settings.DATABASE_URL, min_size=2, max_size=5, ssl=ssl, statement_cache_size=0
+        )
     return _pool
 
 
@@ -254,12 +258,16 @@ async def create_specialty(
     ctx,
     description: str | None = None,
     persona: str | None = None,
-    book_ids: list[int] | None = None,
-) -> SpecialtyItem:
-    """Create a new specialty — a named expert scope over a subset of the library.
+) -> SpecialtyWithSuggestionsItem:
+    """Create a new specialty and receive a suggested corpus for user review.
 
-    Provide a persona to shape how the expert answers (e.g. "You are an expert on
-    Stoic philosophy; prefer primary sources and cite precisely").
+    After calling this, present the suggestions list to the user. They approve
+    or reject each item. Then call confirm_corpus with the approved indices to
+    download and ingest the selected texts.
+
+    Books with source_type='user_upload_required' have no auto-resolvable URL —
+    the user must upload them manually via add_book_from_url and then add them
+    via add_books_to_specialty.
     """
     user_id = _user_id_from_context(ctx)
     svc = await _specialty_service()
@@ -268,9 +276,80 @@ async def create_specialty(
         name=name,
         description=description,
         persona=persona,
-        book_ids=book_ids,
     )
+    return SpecialtyWithSuggestionsItem(
+        id=specialty.id,
+        name=specialty.name,
+        description=specialty.description,
+        persona=specialty.persona,
+        book_ids=specialty.book_ids,
+        book_count=specialty.book_count,
+        suggestions=[
+            CorpusSuggestionItem(
+                index=i,
+                title=s.title,
+                author=s.author,
+                tier=str(s.tier),
+                rationale=s.rationale,
+                source_url=s.source_url,
+                source_type=str(s.source_type),
+                approved=s.approved,
+            )
+            for i, s in enumerate(specialty.pending_corpus)
+        ],
+    )
+
+
+@mcp.tool()
+async def confirm_corpus(
+    specialty_id: int,
+    approved_indices: list[int],
+    ctx,
+) -> SpecialtyItem:
+    """Confirm which suggested sources to ingest for a specialty.
+
+    Pass the index values from the suggestions returned by create_specialty.
+    Approved sources are downloaded and ingested in the background.
+    Use get_corpus_status to monitor progress.
+    """
+    user_id = _user_id_from_context(ctx)
+    svc = await _specialty_service()
+    try:
+        specialty = await svc.confirm_corpus(
+            user_id=user_id,
+            specialty_id=specialty_id,
+            approved_indices=approved_indices,
+        )
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
     return _to_specialty_item(specialty)
+
+
+@mcp.tool()
+async def get_corpus_status(specialty_id: int, ctx) -> dict:
+    """Check ingestion progress for a specialty's corpus.
+
+    Returns counts of books by status: ready, processing, pending, failed.
+    A specialty is queryable once at least one book reaches 'ready'.
+    """
+    user_id = _user_id_from_context(ctx)
+    svc = await _specialty_service()
+    try:
+        result = await svc.corpus_status(user_id=user_id, specialty_id=specialty_id)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
+    return {
+        "specialty_id": result.specialty_id,
+        "total": result.total,
+        "ready": result.ready,
+        "processing": result.processing,
+        "pending": result.pending,
+        "failed": result.failed,
+        "books": [
+            {"book_id": b.book_id, "title": b.title, "author": b.author, "status": b.status}
+            for b in result.books
+        ],
+    }
 
 
 @mcp.tool()

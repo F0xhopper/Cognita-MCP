@@ -20,7 +20,7 @@ from cognita.ingestion.parsers import ParsedDocument, parse_document
 
 logger = get_logger(__name__)
 
-_EMBED_BATCH_SIZE = 32  # stay within OpenAI rate limits
+_EMBED_BATCH_SIZE = 20  # ~10k tokens/batch; 1s inter-batch delay keeps well under 1M TPM
 
 
 async def ingest_book(book_id: int, pool: asyncpg.Pool) -> None:
@@ -39,7 +39,7 @@ async def ingest_book(book_id: int, pool: asyncpg.Pool) -> None:
         tmp_path = Path(f"/tmp/cognita_{book_id}.{book.format}")
         tmp_path.write_bytes(file_bytes)
 
-        doc = _parse_with_fallback(tmp_path, book.metadata.title)
+        doc = await _parse_with_fallback(tmp_path, book.metadata.title)
         chunks = build_chunks(doc, book_id, book.user_id)
 
         embeddings = await _embed_chunks([c.text for c in chunks])
@@ -61,11 +61,11 @@ async def ingest_book(book_id: int, pool: asyncpg.Pool) -> None:
         raise IngestionError(str(exc)) from exc
 
 
-def _parse_with_fallback(path: Path, title: str) -> ParsedDocument:
+async def _parse_with_fallback(path: Path, title: str) -> ParsedDocument:
     doc = parse_document(path)
     if doc.is_scanned:
         logger.info("Scanned PDF detected — falling back to Mistral OCR")
-        raw_text = asyncio.get_event_loop().run_until_complete(ocr_pdf(path))
+        raw_text = await ocr_pdf(path)
         doc = ParsedDocument(
             raw_text=raw_text,
             pages=raw_text.split("\n\n---PAGE---\n\n"),
@@ -81,6 +81,8 @@ async def _embed_chunks(texts: list[str]) -> list[list[float]]:
         batch = texts[i : i + _EMBED_BATCH_SIZE]
         batch_embs = await embed_batch(batch)
         all_embeddings.extend(batch_embs)
+        if i + _EMBED_BATCH_SIZE < len(texts):
+            await asyncio.sleep(1)
     return all_embeddings
 
 

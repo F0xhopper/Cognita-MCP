@@ -1,9 +1,17 @@
+import asyncio
+
 import asyncpg
 
+from cognita.books.domain import BookMetadata
 from cognita.books.repository import BookRepository
+from cognita.books.service import BookService
 from cognita.core.exceptions import ConflictError, NotFoundError
-from cognita.specialties.domain import Specialty
+from cognita.ingestion.pipeline import ingest_book
+from cognita.specialties.domain import Specialty, SuggestedSource
 from cognita.specialties.repository import SpecialtyRepository
+from cognita.specialties.schemas import CorpusBookStatus, CorpusStatusResponse
+from cognita.specialties.source_resolver import resolve_sources
+from cognita.specialties.suggester import suggest_corpus
 
 
 class SpecialtyService:
@@ -18,16 +26,17 @@ class SpecialtyService:
         name: str,
         description: str | None = None,
         persona: str | None = None,
-        book_ids: list[int] | None = None,
     ) -> Specialty:
         existing = await self._repo.get_by_name(user_id, name)
         if existing is not None:
             raise ConflictError(f"Specialty already exists: {name}")
+
         specialty = await self._repo.create(user_id, name, description, persona)
-        for book_id in book_ids or []:
-            await self._add_owned_book(user_id, specialty.id, book_id)
-        if book_ids:
-            specialty = await self.get(user_id, specialty.id)
+
+        raw = await suggest_corpus(name, description)
+        suggestions = await resolve_sources(raw)
+        await self._repo.save_pending_corpus(specialty.id, suggestions)
+        specialty.pending_corpus = suggestions
         return specialty
 
     async def get(self, user_id: str, specialty_id: int) -> Specialty:
@@ -74,6 +83,68 @@ class SpecialtyService:
         if not removed:
             raise NotFoundError("Book in specialty", book_id)
         return await self.get(user_id, specialty_id)
+
+    async def confirm_corpus(
+        self,
+        user_id: str,
+        specialty_id: int,
+        approved_indices: list[int],
+    ) -> Specialty:
+        specialty = await self.get(user_id, specialty_id)
+
+        if not specialty.pending_corpus:
+            raise ConflictError("No pending corpus suggestions for this specialty")
+
+        max_idx = len(specialty.pending_corpus) - 1
+        invalid = [i for i in approved_indices if i < 0 or i > max_idx]
+        if invalid:
+            raise ConflictError(f"Invalid suggestion indices: {invalid}")
+
+        approved: list[SuggestedSource] = [specialty.pending_corpus[i] for i in approved_indices]
+        book_svc = BookService(self._pool)
+
+        for item in approved:
+            if item.source_url is None:
+                continue
+            try:
+                meta = BookMetadata(title=item.title, author=item.author)
+                book = await book_svc.add_from_url(user_id=user_id, url=item.source_url, meta=meta)
+                await self._repo.add_book(specialty_id, book.id)
+                asyncio.create_task(ingest_book(book.id, self._pool))
+            except Exception:
+                pass
+
+        await self._repo.clear_pending_corpus(specialty_id)
+        return await self.get(user_id, specialty_id)
+
+    async def corpus_status(self, user_id: str, specialty_id: int) -> CorpusStatusResponse:
+        specialty = await self.get(user_id, specialty_id)
+
+        statuses: list[CorpusBookStatus] = []
+        for book_id in specialty.book_ids:
+            book = await self._book_repo.get(book_id, user_id)
+            if book is None:
+                continue
+            statuses.append(
+                CorpusBookStatus(
+                    book_id=book.id,
+                    title=book.metadata.title,
+                    author=book.metadata.author,
+                    status=book.status,
+                )
+            )
+
+        counts = {s: 0 for s in ("ready", "processing", "failed", "pending")}
+        for s in statuses:
+            if s.status in counts:
+                counts[s.status] += 1
+
+        return CorpusStatusResponse(
+            specialty_id=specialty_id,
+            total=len(statuses),
+            books=statuses,
+            **counts,
+        )
 
     async def resolve_scope(
         self,

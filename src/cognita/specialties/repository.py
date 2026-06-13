@@ -1,23 +1,30 @@
+import json
 import logging
 from datetime import datetime
 
 import asyncpg
 
-from cognita.specialties.domain import Specialty
+from cognita.specialties.domain import SourceTier, SourceType, Specialty, SuggestedSource
 
 logger = logging.getLogger(__name__)
 
 _CREATE_SPECIALTIES_SQL = """
 CREATE TABLE IF NOT EXISTS specialties (
-    id          SERIAL PRIMARY KEY,
-    user_id     TEXT NOT NULL,
-    name        TEXT NOT NULL,
-    description TEXT,
-    persona     TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    id              SERIAL PRIMARY KEY,
+    user_id         TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    description     TEXT,
+    persona         TEXT,
+    pending_corpus  JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (user_id, name)
 );
+"""
+
+_ADD_PENDING_CORPUS_SQL = """
+ALTER TABLE specialties
+    ADD COLUMN IF NOT EXISTS pending_corpus JSONB NOT NULL DEFAULT '[]'::jsonb;
 """
 
 _CREATE_SPECIALTY_BOOKS_SQL = """
@@ -45,6 +52,39 @@ LEFT JOIN specialty_books sb ON sb.specialty_id = s.id
 """
 
 
+def _sources_to_json(items: list[SuggestedSource]) -> str:
+    return json.dumps([
+        {
+            "title": s.title,
+            "author": s.author,
+            "tier": str(s.tier),
+            "rationale": s.rationale,
+            "source_url": s.source_url,
+            "source_type": str(s.source_type),
+            "approved": s.approved,
+        }
+        for s in items
+    ])
+
+
+def _json_to_sources(raw: list | str | None) -> list[SuggestedSource]:
+    if not raw:
+        return []
+    items: list[dict] = raw if isinstance(raw, list) else json.loads(raw)
+    return [
+        SuggestedSource(
+            title=d["title"],
+            author=d["author"],
+            tier=SourceTier(d["tier"]),
+            rationale=d["rationale"],
+            source_url=d.get("source_url"),
+            source_type=SourceType(d["source_type"]),
+            approved=d["approved"],
+        )
+        for d in items
+    ]
+
+
 def _row_to_specialty(row: asyncpg.Record) -> Specialty:
     d = dict(row)
     return Specialty(
@@ -54,6 +94,7 @@ def _row_to_specialty(row: asyncpg.Record) -> Specialty:
         description=d["description"],
         persona=d["persona"],
         book_ids=list(d.get("book_ids") or []),
+        pending_corpus=_json_to_sources(d.get("pending_corpus")),
         created_at=d["created_at"],
         updated_at=d["updated_at"],
     )
@@ -66,6 +107,7 @@ class SpecialtyRepository:
     async def ensure_schema(self) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(_CREATE_SPECIALTIES_SQL)
+            await conn.execute(_ADD_PENDING_CORPUS_SQL)
             await conn.execute(_CREATE_SPECIALTY_BOOKS_SQL)
             for sql in _CREATE_INDEXES_SQL:
                 try:
@@ -165,3 +207,17 @@ class SpecialtyRepository:
                 specialty_id, book_id,
             )
         return result == "DELETE 1"
+
+    async def save_pending_corpus(self, specialty_id: int, items: list[SuggestedSource]) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE specialties SET pending_corpus = $1 WHERE id = $2",
+                _sources_to_json(items), specialty_id,
+            )
+
+    async def clear_pending_corpus(self, specialty_id: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE specialties SET pending_corpus = '[]'::jsonb WHERE id = $1",
+                specialty_id,
+            )

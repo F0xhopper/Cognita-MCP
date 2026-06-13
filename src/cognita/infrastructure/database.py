@@ -14,6 +14,7 @@ async def init_pool() -> None:
         max_size=10,
         ssl=ssl,
         init=_init_connection,
+        statement_cache_size=0,
     )
 
 
