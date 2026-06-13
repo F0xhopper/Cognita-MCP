@@ -4,6 +4,7 @@ import asyncpg
 
 from cognita.books.domain import Book, BookFormat, BookMetadata, BookStatus, BookSummary
 from cognita.books.repository import BookRepository
+from cognita.books.url_fetcher import fetch_book_from_url
 from cognita.chunks.repository import ChunkRepository
 from cognita.core.exceptions import NotFoundError, UnsupportedFormatError
 from cognita.infrastructure.storage import storage
@@ -44,6 +45,18 @@ class BookService:
             meta=meta,
         )
         return book
+
+    async def add_from_url(self, user_id: str, url: str, meta: BookMetadata) -> Book:
+        data, fmt, filename = await fetch_book_from_url(url)
+        path = await storage().save(user_id, data, filename)
+        return await self._repo.create(
+            user_id=user_id,
+            status=BookStatus.PENDING,
+            fmt=fmt,
+            storage_path=path,
+            file_size_bytes=len(data),
+            meta=meta,
+        )
 
     async def list_books(self, user_id: str) -> list[BookSummary]:
         return await self._repo.list_for_user(user_id)

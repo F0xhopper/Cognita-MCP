@@ -17,9 +17,11 @@ import sys
 import asyncpg
 from mcp.server.fastmcp import FastMCP
 
-from cognita.books.domain import BookStatus
+from cognita.books.domain import BookMetadata, BookStatus
 from cognita.books.repository import BookRepository
 from cognita.books.service import BookService
+from cognita.core.exceptions import UnsupportedFormatError, UrlFetchError
+from cognita.ingestion.worker import ingest_book_task
 from cognita.core.config import settings
 from cognita.core.logging import get_logger, setup_logging
 from cognita.infrastructure.database import init_pool, get_pool
@@ -203,6 +205,55 @@ async def semantic_search(
     svc = await _search_service()
     resp = await svc.search(user_id=user_id, query=query, book_ids=book_ids, top_k=top_k)
     return [_to_passage_result(r) for r in resp.results]
+
+
+# ── Library management ────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def add_book_from_url(
+    url: str,
+    title: str,
+    ctx,
+    author: str | None = None,
+    year: int | None = None,
+    language: str = "en",
+    tags: list[str] | None = None,
+) -> BookItem:
+    """Add a book to the library by downloading it from a URL.
+
+    The book is fetched immediately and then ingested in the background —
+    it will appear as status='pending' and transition to 'ready' once ingestion
+    completes (typically a few seconds to a few minutes depending on size).
+
+    Supported formats: PDF, EPUB, plain-text (TXT).
+    The URL must be publicly accessible; private/internal addresses are rejected.
+    Use list_books to poll status after calling this.
+    """
+    user_id = _user_id_from_context(ctx)
+    meta = BookMetadata(
+        title=title,
+        author=author,
+        year=year,
+        language=language,
+        tags=tags or [],
+    )
+    svc = await _book_service()
+    try:
+        book = await svc.add_from_url(user_id=user_id, url=url, meta=meta)
+    except UrlFetchError as exc:
+        raise ValueError(str(exc)) from exc
+    except UnsupportedFormatError as exc:
+        raise ValueError(str(exc)) from exc
+
+    ingest_book_task.delay(book.id)
+    return BookItem(
+        id=book.id,
+        title=book.metadata.title,
+        author=book.metadata.author,
+        format=str(book.format),
+        chunk_count=0,
+        status=str(book.status),
+    )
 
 
 # ── Specialties — scoped experts over slices of the library ──────────────────

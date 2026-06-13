@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, Field
 
 from cognita.books.domain import BookFormat, BookStatus
 
@@ -14,6 +14,11 @@ class BookMetadataInput(BaseModel):
     isbn: str | None = None
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
+
+
+class AddBookFromUrlRequest(BaseModel):
+    url: AnyHttpUrl = Field(..., description="Public URL to a PDF, EPUB, or plain-text file")
+    metadata: BookMetadataInput
 
 
 class TocEntryResponse(BaseModel):

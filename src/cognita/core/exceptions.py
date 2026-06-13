@@ -29,3 +29,7 @@ class UnsupportedFormatError(CognitaError):
     def __init__(self, fmt: str) -> None:
         super().__init__(f"Unsupported file format: {fmt}")
         self.fmt = fmt
+
+
+class UrlFetchError(CognitaError):
+    pass

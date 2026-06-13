@@ -4,9 +4,14 @@ from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 
 from cognita.auth.dependencies import get_current_user_id
 from cognita.books.domain import BookMetadata
-from cognita.books.schemas import BookResponse, BookSummaryResponse, TocEntryResponse
+from cognita.books.schemas import (
+    AddBookFromUrlRequest,
+    BookResponse,
+    BookSummaryResponse,
+    TocEntryResponse,
+)
 from cognita.books.service import BookService
-from cognita.core.exceptions import NotFoundError, UnsupportedFormatError
+from cognita.core.exceptions import NotFoundError, UnsupportedFormatError, UrlFetchError
 from cognita.infrastructure.database import get_pool
 from cognita.ingestion.worker import ingest_book_task
 
@@ -67,6 +72,36 @@ async def upload_book(
         raise HTTPException(status_code=415, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=413, detail=str(exc))
+
+    ingest_book_task.delay(book.id)
+    return BookSummaryResponse(
+        id=book.id, title=book.metadata.title, author=book.metadata.author,
+        status=book.status, format=book.format, chunk_count=0, created_at=book.created_at,
+    )
+
+
+@router.post("/from-url", response_model=BookSummaryResponse, status_code=status.HTTP_202_ACCEPTED)
+async def add_book_from_url(
+    body: AddBookFromUrlRequest,
+    user_id: str = Depends(get_current_user_id),
+    svc: BookService = Depends(_get_service),
+):
+    meta = BookMetadata(
+        title=body.metadata.title,
+        author=body.metadata.author,
+        year=body.metadata.year,
+        publisher=body.metadata.publisher,
+        language=body.metadata.language,
+        isbn=body.metadata.isbn,
+        description=body.metadata.description,
+        tags=body.metadata.tags,
+    )
+    try:
+        book = await svc.add_from_url(user_id=user_id, url=str(body.url), meta=meta)
+    except UrlFetchError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except UnsupportedFormatError as exc:
+        raise HTTPException(status_code=415, detail=str(exc))
 
     ingest_book_task.delay(book.id)
     return BookSummaryResponse(
