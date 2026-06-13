@@ -6,8 +6,6 @@ services:
       - "8000:8000"
     env_file: .env
     depends_on:
-      db:
-        condition: service_healthy
       redis:
         condition: service_healthy
     volumes:
@@ -20,9 +18,6 @@ services:
     ports:
       - "8001:8001"
     env_file: .env
-    depends_on:
-      db:
-        condition: service_healthy
     volumes:
       - uploads:/data/uploads
     restart: unless-stopped
@@ -32,29 +27,11 @@ services:
     command: cognita-worker
     env_file: .env
     depends_on:
-      db:
-        condition: service_healthy
       redis:
         condition: service_healthy
     volumes:
       - uploads:/data/uploads
     restart: unless-stopped
-
-  db:
-    image: pgvector/pgvector:pg16
-    environment:
-      POSTGRES_USER: cognita
-      POSTGRES_PASSWORD: cognita
-      POSTGRES_DB: cognita
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cognita"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
 
   redis:
     image: redis:7-alpine
@@ -67,5 +44,4 @@ services:
       retries: 5
 
 volumes:
-  pgdata:
   uploads:
