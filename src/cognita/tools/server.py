@@ -25,7 +25,6 @@ from cognita.ingestion.worker import ingest_book_task
 from cognita.core.config import settings
 from cognita.core.logging import get_logger, setup_logging
 from cognita.infrastructure.database import init_pool, get_pool
-from cognita.infrastructure.storage import storage
 from cognita.research.service import ResearchService
 from cognita.search.service import SearchService
 from cognita.specialties.service import SpecialtyService

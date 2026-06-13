@@ -44,7 +44,6 @@ class Book:
     user_id: str
     status: BookStatus
     format: BookFormat
-    storage_path: str       # local path or S3 key
     file_size_bytes: int
     metadata: BookMetadata
     toc: list[TocEntry] = field(default_factory=list)

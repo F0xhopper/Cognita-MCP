@@ -7,7 +7,6 @@ from cognita.books.repository import BookRepository
 from cognita.books.url_fetcher import fetch_book_from_url
 from cognita.chunks.repository import ChunkRepository
 from cognita.core.exceptions import NotFoundError, UnsupportedFormatError
-from cognita.infrastructure.storage import storage
 
 _ALLOWED_FORMATS = {
     "application/pdf": BookFormat.PDF,
@@ -35,25 +34,22 @@ class BookService:
         if len(data) > _MAX_FILE_SIZE:
             raise ValueError(f"File exceeds {_MAX_FILE_SIZE // (1024*1024)} MB limit")
 
-        path = await storage().save(user_id, data, file.filename or "upload")
-        book = await self._repo.create(
-            user_id=user_id,
-            status=BookStatus.PENDING,
-            fmt=fmt,
-            storage_path=path,
-            file_size_bytes=len(data),
-            meta=meta,
-        )
-        return book
-
-    async def add_from_url(self, user_id: str, url: str, meta: BookMetadata) -> Book:
-        data, fmt, filename = await fetch_book_from_url(url)
-        path = await storage().save(user_id, data, filename)
         return await self._repo.create(
             user_id=user_id,
             status=BookStatus.PENDING,
             fmt=fmt,
-            storage_path=path,
+            file_data=data,
+            file_size_bytes=len(data),
+            meta=meta,
+        )
+
+    async def add_from_url(self, user_id: str, url: str, meta: BookMetadata) -> Book:
+        data, fmt, _filename = await fetch_book_from_url(url)
+        return await self._repo.create(
+            user_id=user_id,
+            status=BookStatus.PENDING,
+            fmt=fmt,
+            file_data=data,
             file_size_bytes=len(data),
             meta=meta,
         )
@@ -75,7 +71,6 @@ class BookService:
         if book is None:
             raise NotFoundError("Book", book_id)
         await self._chunk_repo.delete_for_book(book_id)
-        await storage().delete(book.storage_path)
         await self._repo.delete(book_id, user_id)
 
 

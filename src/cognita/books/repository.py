@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS books (
     user_id         TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',
     format          TEXT NOT NULL,
-    storage_path    TEXT NOT NULL,
+    file_data       BYTEA NOT NULL DEFAULT ''::bytea,
     file_size_bytes BIGINT NOT NULL DEFAULT 0,
     title           TEXT NOT NULL,
     author          TEXT,
@@ -69,7 +69,6 @@ def _row_to_book(row: asyncpg.Record) -> Book:
         user_id=d["user_id"],
         status=BookStatus(d["status"]),
         format=BookFormat(d["format"]),
-        storage_path=d["storage_path"],
         file_size_bytes=d["file_size_bytes"],
         metadata=meta,
         toc=toc,
@@ -98,7 +97,7 @@ class BookRepository:
         user_id: str,
         status: BookStatus,
         fmt: BookFormat,
-        storage_path: str,
+        file_data: bytes,
         file_size_bytes: int,
         meta: BookMetadata,
     ) -> Book:
@@ -106,22 +105,56 @@ class BookRepository:
             row = await conn.fetchrow(
                 """
                 INSERT INTO books
-                    (user_id, status, format, storage_path, file_size_bytes,
+                    (user_id, status, format, file_data, file_size_bytes,
                      title, author, year, publisher, language, isbn, description, tags)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-                RETURNING *
+                RETURNING id, user_id, status, format, file_size_bytes,
+                          title, author, year, publisher, language, isbn,
+                          description, tags, toc, chunk_count, error_message,
+                          created_at, updated_at
                 """,
-                user_id, str(status), str(fmt), storage_path, file_size_bytes,
+                user_id, str(status), str(fmt), file_data, file_size_bytes,
                 meta.title, meta.author, meta.year, meta.publisher,
                 meta.language, meta.isbn, meta.description,
                 json.dumps(meta.tags),
             )
         return _row_to_book(row)
 
+    async def get_by_id(self, book_id: int) -> Book | None:
+        """Fetch without user scoping — for internal/worker use only."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, user_id, status, format, file_size_bytes,
+                       title, author, year, publisher, language, isbn,
+                       description, tags, toc, chunk_count, error_message,
+                       created_at, updated_at
+                FROM books WHERE id = $1
+                """,
+                book_id,
+            )
+        return _row_to_book(row) if row else None
+
+    async def get_file_data(self, book_id: int) -> bytes:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT file_data FROM books WHERE id = $1",
+                book_id,
+            )
+        if row is None:
+            raise KeyError(f"Book {book_id} not found")
+        return bytes(row["file_data"])
+
     async def get(self, book_id: int, user_id: str) -> Book | None:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM books WHERE id = $1 AND user_id = $2",
+                """
+                SELECT id, user_id, status, format, file_size_bytes,
+                       title, author, year, publisher, language, isbn,
+                       description, tags, toc, chunk_count, error_message,
+                       created_at, updated_at
+                FROM books WHERE id = $1 AND user_id = $2
+                """,
                 book_id, user_id,
             )
         return _row_to_book(row) if row else None

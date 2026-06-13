@@ -15,7 +15,6 @@ from cognita.core.exceptions import IngestionError
 from cognita.core.logging import get_logger
 from cognita.infrastructure.embeddings import embed_batch
 from cognita.infrastructure.mistral import ocr_pdf
-from cognita.infrastructure.storage import storage
 from cognita.ingestion.chunker import build_chunks
 from cognita.ingestion.parsers import ParsedDocument, parse_document
 
@@ -28,7 +27,7 @@ async def ingest_book(book_id: int, pool: asyncpg.Pool) -> None:
     book_repo = BookRepository(pool)
     chunk_repo = ChunkRepository(pool)
 
-    book = await book_repo.get(book_id, user_id="__system__")  # worker bypasses user scoping
+    book = await book_repo.get_by_id(book_id)
     if book is None:
         raise IngestionError(f"Book {book_id} not found")
 
@@ -36,8 +35,8 @@ async def ingest_book(book_id: int, pool: asyncpg.Pool) -> None:
     logger.info("Ingesting book_id=%d title=%r", book_id, book.metadata.title)
 
     try:
-        file_bytes = await storage().read(book.storage_path)
-        tmp_path = Path(f"/tmp/cognita_{book_id}{Path(book.storage_path).suffix}")
+        file_bytes = await book_repo.get_file_data(book_id)
+        tmp_path = Path(f"/tmp/cognita_{book_id}.{book.format}")
         tmp_path.write_bytes(file_bytes)
 
         doc = _parse_with_fallback(tmp_path, book.metadata.title)
