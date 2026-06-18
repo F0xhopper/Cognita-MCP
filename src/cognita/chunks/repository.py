@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     book_id        INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
     user_id        TEXT NOT NULL,
     text           TEXT NOT NULL,
+    context        TEXT,
     level          TEXT NOT NULL DEFAULT 'paragraph',
     sequence       INTEGER NOT NULL,
     chapter_title  TEXT,
@@ -33,10 +34,24 @@ CREATE TABLE IF NOT EXISTS chunks (
     paragraph_n    INTEGER,
     token_count    INTEGER NOT NULL DEFAULT 0,
     embedding      vector(3072),
-    fts            TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
+    fts            TSVECTOR GENERATED ALWAYS AS (
+                       to_tsvector('english', coalesce(context, '') || ' ' || text)
+                   ) STORED,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
+
+# Idempotent migration of pre-existing tables to the contextual-retrieval schema.
+# fts is a generated column, so changing its expression means dropping and
+# re-adding it (cheap — it is derived). Only run when not already contextual.
+_MIGRATE_CONTEXT_SQL = [
+    "ALTER TABLE chunks ADD COLUMN IF NOT EXISTS context TEXT",
+    "DROP INDEX IF EXISTS idx_chunks_fts",
+    "ALTER TABLE chunks DROP COLUMN IF EXISTS fts",
+    """ALTER TABLE chunks ADD COLUMN fts TSVECTOR GENERATED ALWAYS AS (
+           to_tsvector('english', coalesce(context, '') || ' ' || text)
+       ) STORED""",
+]
 
 _CREATE_CHUNK_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_chunks_book_id ON chunks (book_id)",
@@ -112,6 +127,7 @@ def _row_to_chunk(row: asyncpg.Record) -> Chunk:
         location=loc,
         embedding=embedding,
         token_count=d.get("token_count", 0),
+        context=d.get("context") or "",
     )
 
 
@@ -122,11 +138,33 @@ class ChunkRepository:
     async def ensure_schema(self) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(_CREATE_CHUNKS_SQL)
+            await self._migrate_contextual_fts(conn)
             for sql in _CREATE_CHUNK_INDEXES_SQL:
                 try:
                     await conn.execute(sql)
                 except Exception as exc:
                     logger.warning("Index creation skipped: %s", exc)
+
+    @staticmethod
+    async def _migrate_contextual_fts(conn) -> None:
+        """Bring an older chunks table up to the contextual-retrieval schema:
+        add the context column and make fts index context + text. No-op once
+        the fts expression already references context."""
+        gen_expr = await conn.fetchval(
+            """
+            SELECT generation_expression
+            FROM information_schema.columns
+            WHERE table_name = 'chunks' AND column_name = 'fts'
+            """
+        )
+        if gen_expr is not None and "context" in gen_expr:
+            return
+        try:
+            for sql in _MIGRATE_CONTEXT_SQL:
+                await conn.execute(sql)
+            logger.info("Migrated chunks.fts to contextual (context + text) index")
+        except Exception as exc:
+            logger.warning("Contextual fts migration skipped: %s", exc)
 
     async def bulk_insert(self, chunks: list[Chunk]) -> list[int]:
         """Insert chunks in a single transaction. Returns assigned IDs."""
@@ -140,14 +178,14 @@ class ChunkRepository:
                     row = await conn.fetchrow(
                         """
                         INSERT INTO chunks
-                            (book_id, user_id, text, level, sequence,
+                            (book_id, user_id, text, context, level, sequence,
                              chapter_title, chapter_n, section_title, section_n,
                              page_start, page_end, char_start, char_end,
                              paragraph_n, token_count, embedding)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::vector)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::vector)
                         RETURNING id
                         """,
-                        c.book_id, c.user_id, c.text, str(c.level), c.sequence,
+                        c.book_id, c.user_id, c.text, c.context or None, str(c.level), c.sequence,
                         c.location.chapter_title, c.location.chapter_n,
                         c.location.section_title, c.location.section_n,
                         c.location.page_start, c.location.page_end,

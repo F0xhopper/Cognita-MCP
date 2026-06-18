@@ -16,6 +16,7 @@ from cognita.core.logging import get_logger
 from cognita.infrastructure.embeddings import embed_batch
 from cognita.infrastructure.mistral import ocr_pdf
 from cognita.ingestion.chunker import build_chunks
+from cognita.ingestion.contextualizer import contextualize_chunks
 from cognita.ingestion.parsers import ParsedDocument, parse_document
 
 logger = get_logger(__name__)
@@ -42,7 +43,15 @@ async def ingest_book(book_id: int, pool: asyncpg.Pool) -> None:
         doc = await _parse_with_fallback(tmp_path, book.metadata.title)
         chunks = build_chunks(doc, book_id, book.user_id)
 
-        embeddings = await _embed_chunks([c.text for c in chunks])
+        # Contextual Retrieval: situate each chunk in its source, then embed the
+        # contextualized text so retrieval matches the passage in context.
+        contexts = await contextualize_chunks(
+            chunks, book.metadata.title, book.metadata.author
+        )
+        for chunk, ctx in zip(chunks, contexts):
+            chunk.context = ctx
+
+        embeddings = await _embed_chunks([_embed_input(c) for c in chunks])
         for chunk, emb in zip(chunks, embeddings):
             chunk.embedding = emb
 
@@ -73,6 +82,12 @@ async def _parse_with_fallback(path: Path, title: str) -> ParsedDocument:
             is_scanned=False,
         )
     return doc
+
+
+def _embed_input(chunk) -> str:
+    """Text sent to the embedding model: the contextual blurb prepended to the
+    passage when present, otherwise the passage alone."""
+    return f"{chunk.context}\n\n{chunk.text}" if chunk.context else chunk.text
 
 
 async def _embed_chunks(texts: list[str]) -> list[list[float]]:

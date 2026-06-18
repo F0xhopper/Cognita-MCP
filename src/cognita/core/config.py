@@ -29,6 +29,19 @@ class Settings:
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     CORPUS_MODEL: str = os.getenv("CORPUS_MODEL", "claude-sonnet-4-6")
 
+    # Contextual Retrieval — situate each chunk in its source before
+    # embedding / full-text indexing (Anthropic's contextual retrieval technique).
+    CONTEXT_ENABLED: bool = os.getenv("CONTEXT_ENABLED", "true").lower() == "true"
+    CONTEXT_MODEL: str = os.getenv("CONTEXT_MODEL", "claude-haiku-4-5-20251001")
+    CONTEXT_MAX_CHARS: int = int(os.getenv("CONTEXT_MAX_CHARS", "8000"))
+    CONTEXT_CONCURRENCY: int = int(os.getenv("CONTEXT_CONCURRENCY", "4"))
+
+    # Reranking — cross-encode the hybrid-search candidates and reorder before
+    # returning. Falls back to plain RRF ordering when disabled or on failure.
+    RERANK_ENABLED: bool = os.getenv("RERANK_ENABLED", "true").lower() == "true"
+    RERANK_MODEL: str = os.getenv("RERANK_MODEL", "claude-haiku-4-5-20251001")
+    RERANK_CANDIDATES: int = int(os.getenv("RERANK_CANDIDATES", "50"))
+
     # Chunking
     CHUNK_SIZE_CHARS: int = int(os.getenv("CHUNK_SIZE_CHARS", "1500"))
     CHUNK_OVERLAP_CHARS: int = int(os.getenv("CHUNK_OVERLAP_CHARS", "200"))
