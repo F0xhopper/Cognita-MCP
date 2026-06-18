@@ -26,14 +26,9 @@ class Settings:
     MISTRAL_OCR_MODEL: str = os.getenv("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
     MISTRAL_CHAT_MODEL: str = os.getenv("MISTRAL_CHAT_MODEL", "mistral-large-latest")
 
-    # Anthropic (specialist sub-agents)
+    # Anthropic (corpus suggestion for new specialties)
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-    SPECIALIST_MODEL: str = os.getenv("SPECIALIST_MODEL", "claude-sonnet-4-6")
-    SPECIALIST_MAX_TOKENS: int = int(os.getenv("SPECIALIST_MAX_TOKENS", "8192"))
-
-    # Research / specialist tuning
-    RESEARCH_TOP_K_PER_QUERY: int = int(os.getenv("RESEARCH_TOP_K_PER_QUERY", "6"))
-    RESEARCH_MAX_PASSAGES: int = int(os.getenv("RESEARCH_MAX_PASSAGES", "24"))
+    CORPUS_MODEL: str = os.getenv("CORPUS_MODEL", "claude-sonnet-4-6")
 
     # Chunking
     CHUNK_SIZE_CHARS: int = int(os.getenv("CHUNK_SIZE_CHARS", "1500"))

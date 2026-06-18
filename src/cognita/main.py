@@ -12,7 +12,6 @@ from cognita.chunks.repository import ChunkRepository
 from cognita.core.config import settings
 from cognita.core.logging import get_logger, setup_logging
 from cognita.infrastructure.database import close_pool, get_pool, init_pool
-from cognita.research.router import router as research_router
 from cognita.search.router import router as search_router
 from cognita.specialties.repository import SpecialtyRepository
 from cognita.specialties.router import router as specialties_router
@@ -56,7 +55,6 @@ def create_app() -> FastAPI:
     app.include_router(books_router)
     app.include_router(search_router)
     app.include_router(specialties_router)
-    app.include_router(research_router)
 
     return app
 

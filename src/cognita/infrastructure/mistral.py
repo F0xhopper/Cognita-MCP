@@ -1,8 +1,7 @@
-"""Mistral AI integration for document parsing, OCR, and research synthesis.
+"""Mistral AI integration for document parsing and OCR.
 
 Used during ingestion to extract clean text from scanned PDFs and complex layouts.
 For well-formed digital PDFs, pypdf is used directly (cheaper, faster).
-Also provides chat helpers used by the deep-research agent.
 """
 
 import base64

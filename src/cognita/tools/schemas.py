@@ -68,19 +68,6 @@ class AddBooksToSpecialtyInput(BaseModel):
     book_ids: list[int] = Field(..., min_length=1, description="Book IDs to add")
 
 
-class DeepResearchInput(BaseModel):
-    question: str = Field(..., description="The research question to investigate")
-    specialty_id: int | None = Field(
-        None,
-        description="Scope research to a specialty (its books and persona); omit for whole library",
-    )
-    book_ids: list[int] | None = Field(None, description="Restrict to specific book IDs")
-    depth: int = Field(
-        2, ge=1, le=3,
-        description="1 = single retrieval pass, 2-3 = wider plan plus gap-check follow-ups",
-    )
-
-
 class GetPassageContextInput(BaseModel):
     chunk_id: int = Field(..., description="Chunk ID from a SemanticSearch result")
     book_id: int
@@ -157,12 +144,3 @@ class SpecialtyWithSuggestionsItem(SpecialtyItem):
     uploaded manually via add_book_from_url after the user locates a copy.
     """
     suggestions: list[CorpusSuggestionItem]
-
-
-class ResearchReportResult(BaseModel):
-    question: str
-    answer: str                # cited prose; markers like [1] refer to entries in citations
-    citations: list[str]       # citations[n-1] corresponds to inline marker [n]
-    sub_queries: list[str]     # the search queries the agent ran
-    specialty_name: str | None
-    passages: list[PassageResult]  # the numbered passages backing the citations, in order

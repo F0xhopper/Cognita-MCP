@@ -60,7 +60,7 @@ async def suggest_corpus(name: str, description: str | None) -> list[SuggestedSo
         prompt += f"\n\nContext: {description}"
 
     response = await client.messages.create(
-        model=settings.SPECIALIST_MODEL,
+        model=settings.CORPUS_MODEL,
         max_tokens=2048,
         system=_SYSTEM,
         tools=[_TOOL],
