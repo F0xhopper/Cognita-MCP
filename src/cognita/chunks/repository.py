@@ -6,7 +6,6 @@ Hybrid search combines:
   - RRF (Reciprocal Rank Fusion) to merge ranked lists
 """
 
-import json
 import logging
 
 import asyncpg

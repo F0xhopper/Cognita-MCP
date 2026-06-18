@@ -23,7 +23,6 @@ from cognita.core.config import settings
 from cognita.core.exceptions import UnsupportedFormatError, UrlFetchError
 from cognita.core.logging import get_logger, setup_logging
 from cognita.ingestion.pipeline import ingest_book
-from cognita.research.service import ResearchService
 from cognita.search.service import SearchService
 from cognita.specialties.service import SpecialtyService
 from cognita.tools.schemas import (
@@ -31,7 +30,6 @@ from cognita.tools.schemas import (
     CorpusSuggestionItem,
     ExpandedPassage,
     PassageResult,
-    ResearchReportResult,
     SpecialtyItem,
     SpecialtyWithSuggestionsItem,
     TocItem,
@@ -43,14 +41,20 @@ logger = get_logger(__name__)
 mcp = FastMCP(
     "Cognita MCP",
     instructions=(
-        "You have access to the user's personal book library. "
-        "Before answering any research question, call list_specialties first to check "
-        "if a relevant expert scope exists, then pass its specialty_id to consult_specialist. "
-        "Only skip this if the user specifies book_ids directly. "
-        "For research questions, always prefer consult_specialist — it runs a specialist agent "
-        "that autonomously searches, expands passages, and returns a synthesized cited answer. "
-        "Use semantic_search only for quick, direct lookups when the user wants a specific passage. "
-        "Use get_passage_context to expand a hit for richer context before quoting. "
+        "You have access to the user's personal book library. Specialties are named expert "
+        "scopes: each bundles a curated set of books with an optional persona — an instruction "
+        "block describing how that expert should reason and write.\n\n"
+        "To answer a research question, do the retrieval yourself:\n"
+        "1. Call list_specialties to see the available scopes. Each returns its persona and its "
+        "book_ids.\n"
+        "2. Choose the specialty that best matches the question. Adopt its persona as your guiding "
+        "voice, and pass its specialty_id to semantic_search to restrict retrieval to its books. "
+        "(Pass book_ids directly, or omit both, to search the whole library instead.)\n"
+        "3. Run several focused semantic_search queries, phrased as text a relevant passage would "
+        "contain rather than as questions. Use get_passage_context to expand promising hits, and "
+        "get_chapter / get_section to read specific structural locations.\n"
+        "4. Synthesize the answer yourself from the retrieved passages. Cite every claim with the "
+        "citation string from the results, and do not speculate beyond what the passages support.\n\n"
         "Always include the citation string when referencing content."
     ),
 )
@@ -83,11 +87,6 @@ async def _search_service() -> SearchService:
 async def _specialty_service() -> SpecialtyService:
     pool = await _get_pool()
     return SpecialtyService(pool)
-
-
-async def _research_service() -> ResearchService:
-    pool = await _get_pool()
-    return ResearchService(pool)
 
 
 # ── Context helper — MCP tools must know which user they're serving ───────────
@@ -244,8 +243,10 @@ async def add_book_from_url(
 async def list_specialties(ctx) -> list[SpecialtyItem]:
     """List the user's specialties — named expert scopes over subsets of the library.
 
-    Each specialty groups books around a subject and may carry a persona.
-    Pass its id as specialty_id to consult_specialist to engage that expert.
+    Each specialty groups books around a subject and may carry a persona (an instruction
+    block describing how that expert reasons and writes) plus the book_ids in its scope.
+    To consult one: adopt its persona, then pass its id as specialty_id to semantic_search
+    (and get_chapter / get_section / get_passage_context) to retrieve only from its books.
     """
     user_id = _user_id_from_context(ctx)
     svc = await _specialty_service()
@@ -365,41 +366,37 @@ async def add_books_to_specialty(
     return _to_specialty_item(specialty)
 
 
-# ── Specialist sub-agent ──────────────────────────────────────────────────────
+# ── Structural retrieval — read specific locations within a book ─────────────
 
 @mcp.tool()
-async def consult_specialist(
-    question: str,
-    ctx,
-    specialty_id: int | None = None,
-    book_ids: list[int] | None = None,
-) -> ResearchReportResult:
-    """Delegate a research question to a specialist agent scoped to a specialty.
+async def get_chapter(book_id: int, chapter_n: int, ctx) -> list[PassageResult]:
+    """Retrieve all passages from a specific chapter by its sequential number.
 
-    The specialist autonomously searches the library, expands promising passages,
-    and synthesizes a cited answer in which every claim carries an inline marker
-    like [1] referring to the returned citations list.
-
-    Pass specialty_id (from list_specialties) to consult a named expert — it will
-    apply that specialty's persona and restrict retrieval to its books.
-    Prefer this over manual semantic_search loops for any substantive question.
+    Use when you know the chapter number (e.g. from get_table_of_contents) and want
+    to read it in full rather than relying on semantic_search hits.
     """
     user_id = _user_id_from_context(ctx)
-    svc = await _research_service()
-    report = await svc.consult(
-        user_id=user_id,
-        question=question,
-        specialty_id=specialty_id,
-        book_ids=book_ids,
+    svc = await _search_service()
+    results = await svc.get_passage_by_location(
+        user_id=user_id, book_id=book_id, chapter_n=chapter_n
     )
-    return ResearchReportResult(
-        question=report.question,
-        answer=report.answer,
-        citations=report.citations,
-        sub_queries=report.sub_queries,
-        specialty_name=report.specialty_name,
-        passages=[_to_passage_result(f.result) for f in report.findings],
+    return [_to_passage_result(r) for r in results]
+
+
+@mcp.tool()
+async def get_section(
+    book_id: int,
+    chapter_n: int,
+    section_n: int,
+    ctx,
+) -> list[PassageResult]:
+    """Retrieve passages from a specific section within a chapter."""
+    user_id = _user_id_from_context(ctx)
+    svc = await _search_service()
+    results = await svc.get_passage_by_location(
+        user_id=user_id, book_id=book_id, chapter_n=chapter_n, section_n=section_n
     )
+    return [_to_passage_result(r) for r in results]
 
 
 @mcp.tool()

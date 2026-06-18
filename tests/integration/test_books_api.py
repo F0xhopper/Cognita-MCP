@@ -4,8 +4,6 @@ Requires a running PostgreSQL with pgvector and a valid DATABASE_URL in .env.
 Run with: pytest tests/integration -v
 """
 
-import io
-import json
 import pytest
 from httpx import ASGITransport, AsyncClient
 

@@ -9,7 +9,7 @@ Strategy:
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from cognita.chunks.domain import Chunk, ChunkLevel, ChunkLocation
 from cognita.core.config import settings
@@ -94,7 +94,6 @@ def _sections_from_toc(text: str, toc: list[dict]) -> list[_Section]:
 
 
 def _sections_from_heuristics(text: str) -> list[_Section]:
-    all_patterns = _CHAPTER_PATTERNS + _SECTION_PATTERNS
     boundaries: list[tuple[int, str, int]] = []  # (char_offset, heading_text, level)
 
     for pattern in _CHAPTER_PATTERNS:
