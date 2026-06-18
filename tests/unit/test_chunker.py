@@ -1,6 +1,5 @@
 """Tests for the hierarchical chunker."""
 
-import pytest
 
 from cognita.ingestion.chunker import _split_into_paragraphs, build_chunks
 from cognita.ingestion.parsers import ParsedDocument

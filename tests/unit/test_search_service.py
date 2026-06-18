@@ -1,7 +1,5 @@
 """Unit tests for citation building in search service."""
 
-import pytest
-from unittest.mock import MagicMock
 
 from cognita.chunks.domain import Chunk, ChunkLevel, ChunkLocation
 from cognita.search.service import _build_citation

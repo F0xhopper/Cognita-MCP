@@ -24,7 +24,6 @@ class Settings:
     # Mistral AI
     MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "")
     MISTRAL_OCR_MODEL: str = os.getenv("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
-    MISTRAL_CHAT_MODEL: str = os.getenv("MISTRAL_CHAT_MODEL", "mistral-large-latest")
 
     # Anthropic (corpus suggestion for new specialties)
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
