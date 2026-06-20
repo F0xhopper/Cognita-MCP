@@ -34,6 +34,7 @@ class Chunk:
     location: ChunkLocation
     embedding: list[float] = field(default_factory=list, repr=False)
     token_count: int = 0
+    context: str = ""                # contextual-retrieval blurb; embedded + indexed alongside text, never quoted
 
 
 @dataclass

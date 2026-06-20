@@ -3,8 +3,10 @@ import asyncpg
 from cognita.books.repository import BookRepository
 from cognita.chunks.domain import Citation
 from cognita.chunks.repository import ChunkRepository
+from cognita.core.config import settings
 from cognita.core.exceptions import NotFoundError
 from cognita.infrastructure.embeddings import embed_text
+from cognita.infrastructure.reranker import rerank
 from cognita.search.domain import PassageContext, SearchResponse, SearchResult
 
 
@@ -22,13 +24,19 @@ class SearchService:
         top_k: int = 10,
     ) -> SearchResponse:
         query_embedding = await embed_text(query)
+
+        # When reranking is on, over-fetch a wider candidate pool from hybrid
+        # search, then let the reranker pick and order the final top_k.
+        rerank_on = settings.RERANK_ENABLED and bool(settings.ANTHROPIC_API_KEY)
+        fetch_k = max(settings.RERANK_CANDIDATES, top_k) if rerank_on else top_k
+
         hits = await self._chunk_repo.hybrid_search(
             user_id=user_id,
             query_embedding=query_embedding,
             query_text=query,
             book_ids=book_ids,
-            candidate_k=top_k * 4,
-            top_k=top_k,
+            candidate_k=max(fetch_k * 4, 100),
+            top_k=fetch_k,
         )
         book_cache: dict[int, str] = {}
         results: list[SearchResult] = []
@@ -38,6 +46,18 @@ class SearchService:
                 book_cache[chunk.book_id] = book.metadata.title if book else "Unknown"
             citation = _build_citation(chunk, book_cache[chunk.book_id])
             results.append(SearchResult(chunk=chunk, score=score, citation=citation))
+
+        if rerank_on and len(results) > 1:
+            ranking = await rerank(query, [r.text for r in results], top_n=top_k)
+            reranked: list[SearchResult] = []
+            for idx, score in ranking:
+                hit = results[idx]
+                hit.score = round(float(score), 4)
+                reranked.append(hit)
+            results = reranked
+        else:
+            results = results[:top_k]
+
         return SearchResponse(query=query, results=results, total=len(results))
 
     async def get_passage_context(
