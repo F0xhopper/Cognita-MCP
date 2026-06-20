@@ -70,3 +70,37 @@ class SpecialtyWithSuggestionsItem(SpecialtyItem):
     uploaded manually via add_book_from_url after the user locates a copy.
     """
     suggestions: list[CorpusSuggestionItem]
+
+
+# ── Query planner schemas ─────────────────────────────────────────────────────
+
+class ResearchPlan(BaseModel):
+    """Structured retrieval plan returned by plan_research.
+
+    Pass specialty_id, subqueries, and depth directly to execute_research_plan.
+    If persona is set, adopt it as your guiding voice when synthesising.
+    """
+    specialty_id: int | None
+    specialty_name: str | None
+    persona: str | None
+    intent: str              # definition | comparison | causal | biographical | thematic | overview
+    subqueries: list[str]   # 2–5 retrieval-phrased queries, ready for execute_research_plan
+    depth: str              # shallow | medium | deep
+    needs_chapter_scan: bool
+
+
+class PassageHit(BaseModel):
+    """A single retrieved passage, passed to assess_coverage."""
+    text: str
+    citation: str
+
+
+class CoverageAssessment(BaseModel):
+    """Returned by assess_coverage — signals whether retrieval is sufficient.
+
+    If satisfied=false, pass suggested_queries back to execute_research_plan.
+    Limit to two coverage loops before synthesising with what you have.
+    """
+    satisfied: bool
+    gaps: list[str]             # aspects of the question not yet covered
+    suggested_queries: list[str]  # retrieval-phrased follow-ups targeting the gaps

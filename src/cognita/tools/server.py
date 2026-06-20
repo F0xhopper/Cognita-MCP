@@ -25,11 +25,16 @@ from cognita.core.logging import get_logger, setup_logging
 from cognita.ingestion.pipeline import ingest_book
 from cognita.search.service import SearchService
 from cognita.specialties.service import SpecialtyService
+from cognita.tools.coverage import assess_coverage as _do_assess_coverage
+from cognita.tools.planner import plan_research as _do_plan_research
 from cognita.tools.schemas import (
     BookItem,
+    CoverageAssessment,
     CorpusSuggestionItem,
     ExpandedPassage,
+    PassageHit,
     PassageResult,
+    ResearchPlan,
     SpecialtyItem,
     SpecialtyWithSuggestionsItem,
     TocItem,
@@ -44,18 +49,22 @@ mcp = FastMCP(
         "You have access to the user's personal book library. Specialties are named expert "
         "scopes: each bundles a curated set of books with an optional persona — an instruction "
         "block describing how that expert should reason and write.\n\n"
-        "To answer a research question, do the retrieval yourself:\n"
-        "1. Call list_specialties to see the available scopes. Each returns its persona and its "
-        "book_ids.\n"
-        "2. Choose the specialty that best matches the question. Adopt its persona as your guiding "
-        "voice, and pass its specialty_id to semantic_search to restrict retrieval to its books. "
-        "(Pass book_ids directly, or omit both, to search the whole library instead.)\n"
-        "3. Run several focused semantic_search queries, phrased as text a relevant passage would "
-        "contain rather than as questions. Use get_passage_context to expand promising hits, and "
-        "get_chapter / get_section to read specific structural locations.\n"
-        "4. Synthesize the answer yourself from the retrieved passages. Cite every claim with the "
-        "citation string from the results, and do not speculate beyond what the passages support.\n\n"
-        "Always include the citation string when referencing content."
+        "To answer a research question, follow this four-step flow:\n\n"
+        "1. PLAN — Call plan_research(question). It selects the best specialty, writes 2–5 "
+        "retrieval subqueries, chooses a depth, and flags whether a chapter scan will be needed. "
+        "If persona is set in the returned plan, adopt it as your guiding voice.\n\n"
+        "2. RETRIEVE — Call execute_research_plan with the specialty_id, subqueries, and depth "
+        "from the plan. All subqueries run in parallel server-side; you get back a single "
+        "merged, reranked passage list. Use get_passage_context on hits that need more context, "
+        "and get_chapter / get_section when needs_chapter_scan=true.\n\n"
+        "3. ASSESS — Call assess_coverage(question, hits) with the passages from step 2. "
+        "If satisfied=true, proceed to synthesis. If not, call execute_research_plan once more "
+        "with the suggested_queries from the assessment. Do not loop more than twice.\n\n"
+        "4. SYNTHESIZE — Write the answer from the retrieved passages only. Cite every claim "
+        "using the citation string from each result. Do not speculate beyond what the passages "
+        "support.\n\n"
+        "Always include the citation string when referencing content. "
+        "For simple factual questions you may skip plan_research and call semantic_search directly."
     ),
 )
 
@@ -186,6 +195,112 @@ async def semantic_search(
     svc = await _search_service()
     resp = await svc.search(user_id=user_id, query=query, book_ids=book_ids, top_k=top_k)
     return [_to_passage_result(r) for r in resp.results]
+
+
+# ── Query planner + parallel retrieval + coverage assessment ──────────────────
+
+_DEPTH_TOP_K: dict[str, int] = {"shallow": 5, "medium": 10, "deep": 15}
+
+
+@mcp.tool()
+async def plan_research(question: str, ctx) -> ResearchPlan:
+    """Plan a research question into a structured retrieval plan.
+
+    Always call this first when answering a non-trivial question. It selects the
+    best specialty, produces 2–5 retrieval-phrased subqueries, chooses a depth,
+    and flags whether a chapter scan will likely be needed.
+
+    Pass specialty_id, subqueries, and depth directly to execute_research_plan.
+    If persona is returned, adopt it as your guiding voice when synthesising.
+    """
+    user_id = _user_id_from_context(ctx)
+    spec_svc = await _specialty_service()
+    specialties = await spec_svc.list_specialties(user_id)
+    spec_dicts = [
+        {"id": s.id, "name": s.name, "description": s.description}
+        for s in specialties
+    ]
+
+    raw = await _do_plan_research(question, spec_dicts)
+
+    specialty_id: int | None = raw.get("specialty_id")
+    spec_name: str | None = None
+    persona: str | None = None
+    if specialty_id is not None:
+        match = next((s for s in specialties if s.id == specialty_id), None)
+        if match:
+            spec_name = match.name
+            persona = match.persona
+
+    return ResearchPlan(
+        specialty_id=specialty_id,
+        specialty_name=spec_name,
+        persona=persona,
+        intent=raw.get("intent", "overview"),
+        subqueries=raw.get("subqueries", [question]),
+        depth=raw.get("depth", "medium"),
+        needs_chapter_scan=bool(raw.get("needs_chapter_scan", False)),
+    )
+
+
+@mcp.tool()
+async def execute_research_plan(
+    question: str,
+    subqueries: list[str],
+    ctx,
+    specialty_id: int | None = None,
+    depth: str = "medium",
+) -> list[PassageResult]:
+    """Run a research plan's subqueries in parallel and return merged results.
+
+    Use the values returned by plan_research. All subqueries are embedded and
+    searched concurrently; results are merged, deduplicated by chunk, and reranked
+    against the original question before returning.
+
+    depth controls the number of passages returned:
+      shallow → 5  |  medium → 10  |  deep → 15
+    """
+    user_id = _user_id_from_context(ctx)
+    book_ids: list[int] | None = None
+    if specialty_id is not None:
+        spec_svc = await _specialty_service()
+        _, book_ids = await spec_svc.resolve_scope(user_id, specialty_id)
+
+    top_k = _DEPTH_TOP_K.get(depth, 10)
+    svc = await _search_service()
+    resp = await svc.batch_search(
+        user_id=user_id,
+        question=question,
+        queries=subqueries,
+        book_ids=book_ids,
+        top_k=top_k,
+    )
+    return [_to_passage_result(r) for r in resp.results]
+
+
+@mcp.tool()
+async def assess_coverage(
+    question: str,
+    hits: list[PassageHit],
+    ctx,
+) -> CoverageAssessment:
+    """Decide whether the retrieved passages adequately answer the question.
+
+    Pass the question and the passages from execute_research_plan. Returns:
+      satisfied — true if the passages are sufficient to answer
+      gaps      — aspects of the question not yet covered
+      suggested_queries — follow-up queries to close the gaps
+
+    If satisfied=false, call execute_research_plan again with suggested_queries.
+    Limit to two coverage loops before synthesising with what you have.
+    """
+    passage_dicts = [{"text": h.text, "citation": h.citation} for h in hits]
+    raw = await _do_assess_coverage(question, passage_dicts)
+    return CoverageAssessment(
+        satisfied=bool(raw.get("satisfied", False)),
+        gaps=raw.get("gaps", []),
+        suggested_queries=raw.get("suggested_queries", []),
+    )
 
 
 # ── Library management ────────────────────────────────────────────────────────

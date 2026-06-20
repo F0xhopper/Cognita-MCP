@@ -1,7 +1,9 @@
+import asyncio
+
 import asyncpg
 
 from cognita.books.repository import BookRepository
-from cognita.chunks.domain import Citation
+from cognita.chunks.domain import Citation, Chunk
 from cognita.chunks.repository import ChunkRepository
 from cognita.core.config import settings
 from cognita.core.exceptions import NotFoundError
@@ -60,6 +62,68 @@ class SearchService:
 
         return SearchResponse(query=query, results=results, total=len(results))
 
+    async def batch_search(
+        self,
+        user_id: str,
+        question: str,
+        queries: list[str],
+        book_ids: list[int] | None = None,
+        top_k: int = 10,
+    ) -> SearchResponse:
+        """Run multiple retrieval queries in parallel and return a merged, reranked result.
+
+        All queries are embedded concurrently, each drives an independent hybrid search,
+        and the resulting hit pools are merged via :func:`_merge_hits` (dedup by chunk_id,
+        keep best RRF score). The merged pool is then reranked against *question* — the
+        original research question, which is a better reranking anchor than any individual
+        subquery.
+        """
+        rerank_on = settings.RERANK_ENABLED and bool(settings.ANTHROPIC_API_KEY)
+        fetch_k = max(settings.RERANK_CANDIDATES, top_k) if rerank_on else top_k
+        candidate_k = max(fetch_k * 4, 100)
+
+        embeddings: list[list[float]] = await asyncio.gather(
+            *[embed_text(q) for q in queries]
+        )
+
+        all_hits: list[list[tuple[Chunk, float]]] = await asyncio.gather(
+            *[
+                self._chunk_repo.hybrid_search(
+                    user_id=user_id,
+                    query_embedding=emb,
+                    query_text=q,
+                    book_ids=book_ids,
+                    candidate_k=candidate_k,
+                    top_k=fetch_k,
+                )
+                for q, emb in zip(queries, embeddings)
+            ]
+        )
+
+        merged = _merge_hits(all_hits)[:max(fetch_k, top_k)]
+
+        book_cache: dict[int, str] = {}
+        results: list[SearchResult] = []
+        for chunk, score in merged:
+            if chunk.book_id not in book_cache:
+                book = await self._book_repo.get(chunk.book_id, user_id)
+                book_cache[chunk.book_id] = book.metadata.title if book else "Unknown"
+            citation = _build_citation(chunk, book_cache[chunk.book_id])
+            results.append(SearchResult(chunk=chunk, score=score, citation=citation))
+
+        if rerank_on and len(results) > 1:
+            ranking = await rerank(question, [r.text for r in results], top_n=top_k)
+            reranked: list[SearchResult] = []
+            for idx, score in ranking:
+                hit = results[idx]
+                hit.score = round(float(score), 4)
+                reranked.append(hit)
+            results = reranked
+        else:
+            results = results[:top_k]
+
+        return SearchResponse(query=question, results=results, total=len(results))
+
     async def get_passage_context(
         self,
         user_id: str,
@@ -103,6 +167,25 @@ class SearchService:
             SearchResult(chunk=c, score=1.0, citation=_build_citation(c, title))
             for c in chunks
         ]
+
+
+def _merge_hits(
+    all_hits: list[list[tuple[Chunk, float]]],
+) -> list[tuple[Chunk, float]]:
+    """Deduplicate hits from multiple searches, keeping the best score per chunk.
+
+    Each inner list is the result of one subquery's hybrid search. Chunks that
+    appear in multiple lists are collapsed to a single entry with the highest
+    RRF score seen, so the best-matched subquery wins for ranking purposes.
+    """
+    best: dict[int, tuple[Chunk, float]] = {}
+    for hits in all_hits:
+        for chunk, score in hits:
+            if chunk.id not in best or score > best[chunk.id][1]:
+                best[chunk.id] = (chunk, score)
+    merged = list(best.values())
+    merged.sort(key=lambda x: x[1], reverse=True)
+    return merged
 
 
 def _build_citation(chunk, book_title: str) -> Citation:

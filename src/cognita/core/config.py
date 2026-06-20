@@ -42,6 +42,12 @@ class Settings:
     RERANK_MODEL: str = os.getenv("RERANK_MODEL", "claude-haiku-4-5-20251001")
     RERANK_CANDIDATES: int = int(os.getenv("RERANK_CANDIDATES", "50"))
 
+    # Query planner — converts a research question into a structured retrieval plan.
+    PLANNER_MODEL: str = os.getenv("PLANNER_MODEL", "claude-haiku-4-5-20251001")
+
+    # Coverage assessment — decides when retrieval is sufficient.
+    COVERAGE_MODEL: str = os.getenv("COVERAGE_MODEL", "claude-haiku-4-5-20251001")
+
     # Chunking
     CHUNK_SIZE_CHARS: int = int(os.getenv("CHUNK_SIZE_CHARS", "1500"))
     CHUNK_OVERLAP_CHARS: int = int(os.getenv("CHUNK_OVERLAP_CHARS", "200"))
