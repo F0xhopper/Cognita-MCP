@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Superseded pull-request runs are cancelled. Runs on main are not: cancelling
+# one mid-`flyctl deploy` can leave the app part-way through a release.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  FLY_APP: cognita-mcp
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[dev]"
+      - run: ruff check src/ tests/
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is what the Dockerfile ships; the upper entry guards against
+        # the floor in pyproject (">=3.12") drifting away from reality.
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[dev]"
+      # The suite touches neither a database nor the network, so there is
+      # nothing to stand up here.
+      - run: pytest -q
+
+  docker:
+    # `flyctl deploy` is otherwise the first thing that ever runs this
+    # Dockerfile, and its lxml build step is the part that breaks. Better to
+    # find that on the pull request than on main.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: [lint, test]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://cognita-mcp.fly.dev
+    # Never cancel a deploy in flight; queue the next one behind it instead.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the deploy token exists
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "::error::FLY_API_TOKEN is not set. Create one with" \
+                 "'fly tokens create deploy -a $FLY_APP' and add it under" \
+                 "Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      # Builds on Fly's builders rather than this runner, so the image never
+      # crosses the network twice. Returns once the machine passes the health
+      # check declared in fly.toml.
+      - name: Deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --remote-only
+
+      # /health is the one unauthenticated route, so this needs no token. It
+      # confirms the release is actually serving, not merely that Fly accepted
+      # the image.
+      - name: Smoke-test /health
+        run: |
+          for attempt in $(seq 1 10); do
+            if curl -fsS "https://${FLY_APP}.fly.dev/health" | grep -q '"status":"ok"'; then
+              echo "Health check passed on attempt ${attempt}."
+              exit 0
+            fi
+            sleep 6
+          done
+          echo "::error::/health never reported ok after the deploy."
+          exit 1

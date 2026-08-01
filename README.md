@@ -334,6 +334,30 @@ Two things worth knowing about the shipped `fly.toml`:
   or paste-text tools instead. Flip it only if you genuinely want callers
   reaching that filesystem.
 
+### Deploying on every push
+
+`.github/workflows/ci.yml` lints, tests, and then deploys `main` to Fly. One
+secret is needed:
+
+```bash
+fly tokens create deploy -a cognita-mcp
+```
+
+Add the output as `FLY_API_TOKEN` under **Settings → Secrets and variables →
+Actions**. Pull requests run lint, tests and a Docker build; only `main`
+deploys, and only if lint and tests pass. `workflow_dispatch` gives you a
+manual redeploy button.
+
+The workflow assumes the app already exists — run `fly launch --no-deploy
+--copy-config` once by hand first. If you renamed the app, change `FLY_APP`
+and the `environment.url` at the top of the workflow.
+
+> **A deploy interrupts ingestion.** Machines are replaced on release, and the
+> ingestion queue lives in the process — so a merge to `main` while a book is
+> importing loses whatever was still queued. Those books stay `pending` until
+> you re-ingest them. Check `library_status` before merging, or add a required
+> reviewer to the `production` environment to gate releases.
+
 ### Anywhere else
 
 The `Dockerfile` is a plain Python image with no Fly-specific anything:
@@ -403,7 +427,7 @@ Everything lives in `.env`. Only two variables are required.
 
 ```bash
 pip install -e ".[dev]"
-pytest                       # 116 tests, no database or network needed
+pytest                       # 125 tests, no database or network needed
 ruff check src/ tests/
 ```
 

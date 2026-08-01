@@ -48,10 +48,11 @@ async def ingest_book(book_id: int, pool: asyncpg.Pool) -> None:
         # Re-ingestion must not stack a second copy of every chunk.
         await chunk_repo.delete_for_book(book_id)
 
-        file_bytes = await book_repo.get_file_data(book_id)
         with tempfile.TemporaryDirectory(prefix="cognita-") as tmpdir:
             path = Path(tmpdir) / f"book-{book_id}.{book.format}"
-            path.write_bytes(file_bytes)
+            # Straight from Postgres to disk: the parsers want a path, and the
+            # bytes must not still be in memory once embedding starts.
+            await book_repo.write_file_to(book_id, path)
             doc = await _parse(path, book_id)
 
         if not doc.raw_text.strip():

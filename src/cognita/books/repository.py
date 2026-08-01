@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from pathlib import Path
 
 import asyncpg
 
@@ -43,10 +44,18 @@ CREATE TABLE IF NOT EXISTS books (
 # Brings a library created by an older, multi-user version up to date. Dropping
 # user_id is required rather than cosmetic: the column was NOT NULL, so inserts
 # would fail against a stale table.
+#
+# EXTERNAL storage keeps file_data out of line and *uncompressed*. Both halves
+# matter: PDFs and EPUBs are already compressed so pglz buys nothing, and a
+# compressed TOAST value cannot be sliced without decompressing from the start
+# — which is exactly what write_file_to() does. Postgres applies the strategy to
+# values written from here on, so books stored before this ran keep their old
+# representation until they are re-created.
 _MIGRATE_BOOKS_SQL = [
     "ALTER TABLE books DROP COLUMN IF EXISTS user_id",
     "ALTER TABLE books DROP COLUMN IF EXISTS storage_path",
     "ALTER TABLE books ADD COLUMN IF NOT EXISTS source TEXT",
+    "ALTER TABLE books ALTER COLUMN file_data SET STORAGE EXTERNAL",
 ]
 
 _CREATE_INDEXES_SQL = [
@@ -63,6 +72,11 @@ _BOOK_COLUMNS = """
 """
 
 _SUMMARY_COLUMNS = "id, title, author, status, format, chunk_count, created_at, error_message"
+
+# How much of a book to hold in memory at once when copying it out to disk.
+# Small enough that a 100MB import costs 8MB rather than 100MB, large enough
+# that even the biggest allowed file is a few dozen round trips.
+_SLICE_BYTES = 8 * 1024 * 1024
 
 
 def _row_to_book(row: asyncpg.Record) -> Book:
@@ -159,11 +173,37 @@ class BookRepository:
         return _row_to_book(row) if row else None
 
     async def get_file_data(self, book_id: int) -> bytes:
+        """The whole file in memory. Prefer write_file_to() for anything book-sized."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow("SELECT file_data FROM books WHERE id = $1", book_id)
         if row is None:
             raise KeyError(f"Book {book_id} not found")
         return bytes(row["file_data"])
+
+    async def write_file_to(self, book_id: int, path: Path) -> None:
+        """Copy a book's bytes to disk without ever holding all of them.
+
+        Ingestion peaks on the embeddings it builds later, so the file itself
+        should not still be resident by then. Reading it in slices keeps the
+        cost flat in the size of the book rather than proportional to it.
+        """
+        async with self._pool.acquire() as conn:
+            size = await conn.fetchval(
+                "SELECT octet_length(file_data) FROM books WHERE id = $1", book_id
+            )
+            if size is None:
+                raise KeyError(f"Book {book_id} not found")
+
+            with path.open("wb") as f:
+                for offset in range(0, size, _SLICE_BYTES):
+                    # substring() is 1-indexed, hence the +1.
+                    chunk = await conn.fetchval(
+                        "SELECT substring(file_data FROM $2 FOR $3) FROM books WHERE id = $1",
+                        book_id, offset + 1, _SLICE_BYTES,
+                    )
+                    if chunk is None:
+                        raise KeyError(f"Book {book_id} deleted while being read")
+                    f.write(chunk)
 
     async def list_all(self) -> list[BookSummary]:
         async with self._pool.acquire() as conn:
