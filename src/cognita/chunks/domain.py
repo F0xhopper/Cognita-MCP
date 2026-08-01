@@ -1,16 +1,10 @@
 from dataclasses import dataclass, field
-from enum import StrEnum
-
-
-class ChunkLevel(StrEnum):
-    CHAPTER = "chapter"
-    SECTION = "section"
-    PARAGRAPH = "paragraph"
 
 
 @dataclass
 class ChunkLocation:
-    """Precise location of a chunk within its source book."""
+    """Where a chunk sits inside its source book."""
+
     chapter_title: str | None = None
     chapter_n: int | None = None
     section_title: str | None = None
@@ -19,42 +13,49 @@ class ChunkLocation:
     page_end: int | None = None
     char_start: int | None = None
     char_end: int | None = None
-    paragraph_n: int | None = None   # paragraph ordinal within section
+    paragraph_n: int | None = None  # ordinal within the section
 
 
 @dataclass
 class Chunk:
-    """A text unit stored in the vector DB with its embedding."""
+    """A passage of a book, stored with its embedding."""
+
     id: int
     book_id: int
-    user_id: str
     text: str
-    level: ChunkLevel
-    sequence: int                    # global ordinal across book (for neighbour expansion)
+    sequence: int  # global ordinal across the book, used for neighbour expansion
     location: ChunkLocation
     embedding: list[float] = field(default_factory=list, repr=False)
     token_count: int = 0
-    context: str = ""                # contextual-retrieval blurb; embedded + indexed alongside text, never quoted
+    # Contextual-retrieval blurb: embedded and full-text indexed alongside the
+    # passage so retrieval sees it in context. Never quoted back to the caller.
+    context: str = ""
 
 
 @dataclass
 class Citation:
-    """Human-readable citation for a chunk."""
+    """Human-readable provenance for a passage."""
+
     book_title: str
-    author: str | None
-    chapter: str | None
-    section: str | None
-    page_range: str | None          # e.g. "pp. 42-43"
-    paragraph_n: int | None
+    author: str | None = None
+    chapter: str | None = None
+    section: str | None = None
+    page_range: str | None = None
+    paragraph_n: int | None = None
 
     def to_string(self) -> str:
-        parts = [self.book_title]
-        if self.author:
-            parts[0] = f"{self.author}, {self.book_title}"
-        if self.chapter:
-            parts.append(self.chapter)
-        if self.section:
-            parts.append(self.section)
+        head = f"{self.author}, {self.book_title}" if self.author else self.book_title
+        parts = [head]
+
+        # Short documents often have one heading that repeats the title, which
+        # would render as "Reading notes › Reading notes". Each level is only
+        # worth naming when it says something the previous one did not.
+        seen = {self.book_title}
+        for level in (self.chapter, self.section):
+            if level and level not in seen:
+                parts.append(level)
+                seen.add(level)
+
         if self.page_range:
             parts.append(self.page_range)
         return " › ".join(parts)

@@ -1,0 +1,50 @@
+# Fly.io deployment for a hosted Cognita server.
+#
+#   fly launch --no-deploy --copy-config
+#   fly postgres create --name cognita-db          # or use Supabase / Neon
+#   fly postgres attach cognita-db                 # sets DATABASE_URL
+#   fly secrets set OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-... \
+#                   COGNITA_AUTH_TOKEN="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+#   fly deploy
+#
+# The Postgres instance needs pgvector:
+#   fly postgres connect -a cognita-db
+#   CREATE EXTENSION vector; CREATE EXTENSION pg_trgm;
+
+app = "cognita-mcp"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  MCP_HOST = "0.0.0.0"
+  MCP_PORT = "8080"
+  LOG_LEVEL = "INFO"
+  DATABASE_SSL = "true"
+  # The server's disk is not the caller's disk — keep the local-file tools off.
+  COGNITA_ALLOW_LOCAL_FILES = "false"
+  # MCP rejects any Host header it does not recognise. Change this to match
+  # your app name, or every request comes back 421.
+  COGNITA_ALLOWED_HOSTS = "cognita-mcp.fly.dev"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Ingestion runs in-process, so a machine that stops mid-import loses the
+  # rest of the queue. Keep one machine alive rather than scaling to zero.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+
+[[vm]]
+  # Embedding a full-length book holds a few thousand vectors in memory at once.
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1

@@ -1,3 +1,11 @@
+"""Embeddings via OpenAI.
+
+EMBED_DIM is passed through to the API, so lowering it genuinely produces
+shorter vectors rather than silently disagreeing with the database column.
+text-embedding-3-* support this natively; older models do not, so the parameter
+is only sent when the model accepts it.
+"""
+
 import asyncio
 
 from openai import AsyncOpenAI
@@ -9,8 +17,12 @@ from cognita.core.logging import get_logger
 logger = get_logger(__name__)
 
 _client: AsyncOpenAI | None = None
-# Limit concurrent embedding calls across all concurrent ingestions
-_embed_sem = asyncio.Semaphore(2)
+# One embedding request at a time keeps a folder import from tripping rate
+# limits while a search is also running.
+_semaphore = asyncio.Semaphore(2)
+
+# Only the v3 models accept a dimensions parameter.
+_SUPPORTS_DIMENSIONS = ("text-embedding-3",)
 
 
 def get_embeddings_client() -> AsyncOpenAI:
@@ -20,31 +32,41 @@ def get_embeddings_client() -> AsyncOpenAI:
     return _client
 
 
+def _request_kwargs() -> dict:
+    if settings.EMBED_MODEL.startswith(_SUPPORTS_DIMENSIONS):
+        return {"dimensions": settings.EMBED_DIM}
+    return {}
+
+
 async def embed_text(text: str) -> list[float]:
-    client = get_embeddings_client()
-    async with _embed_sem:
-        try:
-            resp = await client.embeddings.create(
-                model=settings.EMBED_MODEL,
-                input=text.replace("\n", " "),
-            )
-            return resp.data[0].embedding
-        except Exception as exc:
-            logger.error("Embedding failed: %s", exc)
-            raise EmbeddingError(str(exc)) from exc
+    return (await embed_batch([text]))[0]
 
 
 async def embed_batch(texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+
     client = get_embeddings_client()
-    cleaned = [t.replace("\n", " ") for t in texts]
-    async with _embed_sem:
+    cleaned = [t.replace("\n", " ") or " " for t in texts]
+
+    async with _semaphore:
         try:
-            resp = await client.embeddings.create(
+            response = await client.embeddings.create(
                 model=settings.EMBED_MODEL,
                 input=cleaned,
+                **_request_kwargs(),
             )
-            resp.data.sort(key=lambda x: x.index)
-            return [item.embedding for item in resp.data]
         except Exception as exc:
-            logger.error("Batch embedding failed: %s", exc)
+            logger.error("Embedding request failed: %s", exc)
             raise EmbeddingError(str(exc)) from exc
+
+    # The API may return items out of order; index is authoritative.
+    ordered = sorted(response.data, key=lambda item: item.index)
+    embeddings = [item.embedding for item in ordered]
+
+    if embeddings and len(embeddings[0]) != settings.EMBED_DIM:
+        raise EmbeddingError(
+            f"{settings.EMBED_MODEL} returned {len(embeddings[0])}-dimensional vectors "
+            f"but EMBED_DIM is {settings.EMBED_DIM}. Set EMBED_DIM to match the model."
+        )
+    return embeddings

@@ -7,13 +7,15 @@ class BookFormat(StrEnum):
     PDF = "pdf"
     EPUB = "epub"
     TXT = "txt"
+    MD = "md"
+    HTML = "html"
 
 
 class BookStatus(StrEnum):
-    PENDING = "pending"       # uploaded, waiting for worker
-    PROCESSING = "processing" # worker has picked it up
-    READY = "ready"           # fully ingested and searchable
-    FAILED = "failed"         # ingestion failed
+    PENDING = "pending"        # stored, waiting for the ingestion queue
+    PROCESSING = "processing"  # being parsed / embedded right now
+    READY = "ready"            # fully ingested and searchable
+    FAILED = "failed"          # ingestion failed; see error_message
 
 
 @dataclass
@@ -26,22 +28,22 @@ class BookMetadata:
     isbn: str | None = None
     description: str | None = None
     tags: list[str] = field(default_factory=list)
+    source: str | None = None  # where it came from: a path, URL, or "text"
 
 
 @dataclass
 class TocEntry:
     title: str
-    level: int           # 1 = chapter, 2 = section, 3 = subsection
-    sequence: int        # ordinal position in the book
+    level: int  # 1 = chapter, 2 = section, 3 = subsection
+    sequence: int
     start_char: int | None = None
     page_start: int | None = None
-    chunk_id: int | None = None  # points to first chunk of this section
+    chunk_id: int | None = None  # first chunk of this section
 
 
 @dataclass
 class Book:
     id: int
-    user_id: str
     status: BookStatus
     format: BookFormat
     file_size_bytes: int
@@ -62,3 +64,18 @@ class BookSummary:
     format: BookFormat
     chunk_count: int
     created_at: datetime
+    error_message: str | None = None
+
+
+@dataclass
+class LibraryStatus:
+    """Aggregate view of the library — what is searchable and what is still cooking."""
+
+    total: int
+    ready: int
+    processing: int
+    pending: int
+    failed: int
+    chunk_count: int
+    queue_depth: int
+    failures: list[BookSummary] = field(default_factory=list)

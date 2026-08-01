@@ -1,14 +1,20 @@
-"""Reranking — reorder hybrid-search candidates by relevance to the query.
+"""Reranking — reorder retrieved candidates by how well they answer the query.
 
-Hybrid search (semantic + keyword fused with RRF) is good at *recall* but weak at
-ordering: the most relevant passage is often not ranked first. A reranker scores
-each candidate against the query and reorders them, so the top-k handed to the
-caller are the ones that actually answer the question.
+Hybrid search is strong on recall and weak on ordering: the passage that
+actually answers the question is often ranked fourth. A reranker reads each
+candidate against the query and scores it directly, which is a much better
+judgement than either arm's ranking signal.
 
-This implementation uses Claude as a listwise reranker (no extra API key beyond the
-one already required). It is best-effort: when disabled, unconfigured, or on any
-error it returns the candidates in their original RRF order, so search never breaks.
+Claude does the scoring here rather than a dedicated cross-encoder — no extra
+service to run, no second model to host. Candidates are scored in batches so
+the prompt stays small and the batches run concurrently.
+
+Everything is best-effort. Disabled, unconfigured, or failing, this returns
+None and the caller keeps its existing order — search never breaks because
+reranking is unavailable.
 """
+
+import asyncio
 
 from cognita.core.config import settings
 from cognita.core.logging import get_logger
@@ -16,7 +22,15 @@ from cognita.infrastructure.anthropic_client import get_anthropic_client
 
 logger = get_logger(__name__)
 
-_MAX_DOC_CHARS = 1500  # cap each passage shown to the reranker to control token cost
+# Enough to judge relevance; short enough to keep a batch affordable.
+_MAX_DOC_CHARS = 1200
+
+_SYSTEM = (
+    "You are a search reranker for a personal library. Score how directly each "
+    "passage answers the query: 1.0 means it contains the answer, 0.5 means it is "
+    "on-topic but does not answer, 0.0 means it is irrelevant. Judge the passage "
+    "text, not the surrounding context line. Score every passage exactly once."
+)
 
 _TOOL = {
     "name": "rank_passages",
@@ -26,14 +40,14 @@ _TOOL = {
         "properties": {
             "rankings": {
                 "type": "array",
-                "description": "One entry per passage, by its index.",
+                "description": "One entry per passage, identified by its index.",
                 "items": {
                     "type": "object",
                     "properties": {
                         "index": {"type": "integer", "description": "The passage's index."},
                         "relevance": {
                             "type": "number",
-                            "description": "0.0 (irrelevant) to 1.0 (directly answers the query).",
+                            "description": "0.0 (irrelevant) to 1.0 (directly answers).",
                         },
                     },
                     "required": ["index", "relevance"],
@@ -47,53 +61,87 @@ _TOOL = {
 
 async def rerank(
     query: str,
-    documents: list[str],
+    documents: list[tuple[str, str]],
     top_n: int,
-) -> list[tuple[int, float]]:
-    """Rank `documents` against `query`. Returns (original_index, score) pairs,
-    best first, length ≤ top_n. Falls back to original order on any problem."""
-    n = len(documents)
-    identity = [(i, 0.0) for i in range(min(n, top_n))]
-    if not settings.RERANK_ENABLED or not settings.ANTHROPIC_API_KEY or n <= 1:
-        return identity
+) -> list[tuple[int, float]] | None:
+    """Score `documents` — (text, context) pairs — against `query`.
 
-    try:
-        client = get_anthropic_client()
-        passages = "\n\n".join(f"[{i}]\n{documents[i][:_MAX_DOC_CHARS]}" for i in range(n))
-        resp = await client.messages.create(
-            model=settings.RERANK_MODEL,
-            max_tokens=2048,
-            system=(
-                "You are a search reranker. Score how directly each passage answers "
-                "the query. Score every passage exactly once, by its index."
-            ),
-            tools=[_TOOL],
-            tool_choice={"type": "tool", "name": "rank_passages"},
-            messages=[{
+    Returns (original_index, score) pairs, best first, at most `top_n` long.
+    Returns None when reranking is unavailable, meaning "keep your own order".
+    """
+    if not settings.rerank_enabled or len(documents) <= 1:
+        return None
+
+    size = max(1, settings.RERANK_BATCH_SIZE)
+    batches = [
+        list(range(start, min(start + size, len(documents))))
+        for start in range(0, len(documents), size)
+    ]
+
+    results = await asyncio.gather(
+        *(_score_batch(query, documents, batch) for batch in batches),
+        return_exceptions=True,
+    )
+
+    scored: list[tuple[int, float]] = []
+    failed = 0
+    for batch, result in zip(batches, results, strict=True):
+        if isinstance(result, dict):
+            scored.extend(result.items())
+        else:
+            failed += 1
+            logger.warning("Rerank batch failed: %s", result)
+            # Keep the batch's own retrieval order by scoring it below anything
+            # the model actually judged, rather than dropping it outright.
+            scored.extend((index, 0.0) for index in batch)
+
+    if failed == len(batches):
+        return None
+
+    # Ties keep their retrieval order, so an unscored passage never leapfrogs.
+    scored.sort(key=lambda pair: (-pair[1], pair[0]))
+    return scored[:top_n]
+
+
+async def _score_batch(
+    query: str,
+    documents: list[tuple[str, str]],
+    indices: list[int],
+) -> dict[int, float]:
+    client = get_anthropic_client()
+
+    blocks = []
+    for index in indices:
+        text, context = documents[index]
+        header = f"[{index}]"
+        if context:
+            header += f"\n(context: {context.strip()[:300]})"
+        blocks.append(f"{header}\n{text[:_MAX_DOC_CHARS]}")
+
+    response = await client.messages.create(
+        model=settings.RERANK_MODEL,
+        max_tokens=1024,
+        system=_SYSTEM,
+        tools=[_TOOL],
+        tool_choice={"type": "tool", "name": "rank_passages"},
+        messages=[
+            {
                 "role": "user",
-                "content": f"Query: {query}\n\nPassages:\n\n{passages}",
-            }],
-        )
-        block = next(b for b in resp.content if getattr(b, "type", None) == "tool_use")
-        rankings = block.input.get("rankings", [])
+                "content": f"Query: {query}\n\nPassages:\n\n" + "\n\n".join(blocks),
+            }
+        ],
+    )
 
-        seen: set[int] = set()
-        scored: list[tuple[int, float]] = []
-        for r in rankings:
-            idx, score = r.get("index"), r.get("relevance")
-            if isinstance(idx, int) and 0 <= idx < n and idx not in seen \
-                    and isinstance(score, (int, float)):
-                seen.add(idx)
-                scored.append((idx, float(score)))
+    block = next(b for b in response.content if getattr(b, "type", None) == "tool_use")
+    allowed = set(indices)
+    scores: dict[int, float] = {}
 
-        if not scored:
-            return identity
+    for entry in block.input.get("rankings", []):
+        index, relevance = entry.get("index"), entry.get("relevance")
+        if index in allowed and index not in scores and isinstance(relevance, int | float):
+            scores[index] = max(0.0, min(1.0, float(relevance)))
 
-        scored.sort(key=lambda x: x[1], reverse=True)
-        # Append any passages the model skipped, preserving their RRF order.
-        scored.extend((i, 0.0) for i in range(n) if i not in seen)
-        return scored[:top_n]
-
-    except Exception as exc:
-        logger.warning("Rerank failed, falling back to RRF order: %s", exc)
-        return identity
+    # A passage the model declined to score still belongs in the output.
+    for index in indices:
+        scores.setdefault(index, 0.0)
+    return scores

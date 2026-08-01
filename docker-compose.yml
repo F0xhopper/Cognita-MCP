@@ -1,23 +1,45 @@
-services:
-  api:
-    build: .
-    command: cognita-api
-    ports:
-      - "8000:8000"
-    env_file: .env
-    volumes:
-      - uploads:/data/uploads
-    restart: unless-stopped
+# Local development: a pgvector Postgres plus the server over HTTP.
+#
+#   cp .env.example .env      # fill in OPENAI_API_KEY
+#   docker compose up
+#
+# For Claude Desktop you usually want stdio instead — see the README. This
+# compose file is for running the HTTP transport, or just for the database:
+#
+#   docker compose up db
 
-  mcp:
-    build: .
-    command: cognita-mcp
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: cognita
     ports:
-      - "8001:8001"
-    env_file: .env
+      - "5432:5432"
     volumes:
-      - uploads:/data/uploads
+      - library:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cognita"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  cognita:
+    build: .
+    command: cognita --http
+    ports:
+      - "8001:8080"
+    env_file:
+      # Optional so `docker compose up db` works before you have written one.
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/cognita
+      DATABASE_SSL: "false"
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
-  uploads:
+  library:

@@ -1,218 +1,201 @@
-"""Hierarchical chunker: chapters → sections → paragraph-sized chunks with overlap.
+"""Split a parsed document into retrievable chunks.
 
-Strategy:
-  1. Use native ToC (from PDF outline / EPUB headings) to identify chapters/sections.
-  2. If no native ToC, fall back to heuristic heading detection (ALL CAPS lines,
-     numbered headings like "Chapter 1", markdown-style "# Heading").
-  3. Within each section, split into paragraph-sized chunks respecting sentence
-     boundaries. Overlap is applied by repeating the last N chars of the prev chunk.
+Two passes:
+
+  1. **Structure** — the document's headings carve the text into sections, each
+     tagged with its chapter and section title. Headings come from the PDF
+     outline, EPUB/HTML heading tags, Markdown ``#`` lines, or, failing all of
+     those, pattern matching over the raw text.
+  2. **Chunking** — each section is packed into chunks of at most
+     ``CHUNK_SIZE_CHARS``, splitting only on paragraph boundaries so a chunk is
+     never cut mid-sentence. Consecutive chunks overlap by whole trailing
+     paragraphs (up to ``CHUNK_OVERLAP_CHARS``) so an idea spanning a boundary
+     is still retrievable from either side.
+
+Every chunk records the exact character span it came from, which is what lets a
+citation name a real page.
 """
 
 import re
-from dataclasses import dataclass
 
-from cognita.chunks.domain import Chunk, ChunkLevel, ChunkLocation
+from cognita.chunks.domain import Chunk, ChunkLocation
 from cognita.core.config import settings
 from cognita.core.logging import get_logger
-from cognita.ingestion.parsers import ParsedDocument
+from cognita.ingestion.parsers import Heading, ParsedDocument
 
 logger = get_logger(__name__)
 
-_CHAPTER_PATTERNS = [
-    re.compile(r"^(chapter|part|book)\s+\w+[\s:—–-]", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^\s{0,4}[IVXLC]+\.\s+\w", re.MULTILINE),       # Roman numerals
-    re.compile(r"^\s{0,4}\d{1,2}\.\s+[A-Z][A-Za-z ]{3,}", re.MULTILINE),
-]
+# A paragraph is a run of non-blank lines.
+_PARAGRAPH = re.compile(r"[^\n]+(?:\n(?!\s*\n)[^\n]+)*")
 
-_SECTION_PATTERNS = [
-    re.compile(r"^\s{0,4}#{1,3} .+", re.MULTILINE),              # Markdown headings
-    re.compile(r"^[A-Z][A-Z\s]{5,40}$", re.MULTILINE),           # ALL CAPS lines
-]
+# Documents with no detectable structure at all still need one section to live in.
+_DEFAULT_SECTION_TITLE = "Full Text"
 
 
-@dataclass
 class _Section:
-    title: str
-    level: int
-    text: str
-    start_char: int
-    chapter_n: int
-    section_n: int
-    chapter_title: str
+    __slots__ = ("title", "chapter_title", "chapter_n", "section_n", "start", "end")
+
+    def __init__(
+        self,
+        title: str,
+        chapter_title: str,
+        chapter_n: int,
+        section_n: int,
+        start: int,
+        end: int,
+    ) -> None:
+        self.title = title
+        self.chapter_title = chapter_title
+        self.chapter_n = chapter_n
+        self.section_n = section_n
+        self.start = start
+        self.end = end
 
 
-def _detect_sections(text: str, native_toc: list[dict]) -> list[_Section]:
-    if native_toc:
-        return _sections_from_toc(text, native_toc)
-    return _sections_from_heuristics(text)
+def _build_sections(doc: ParsedDocument) -> list[_Section]:
+    """Turn headings into non-overlapping, numbered sections covering the text."""
+    text_len = len(doc.raw_text)
+    headings = [h for h in doc.headings if 0 <= h.char_offset < text_len]
+    headings.sort(key=lambda h: h.char_offset)
 
-
-def _sections_from_toc(text: str, toc: list[dict]) -> list[_Section]:
-    sections: list[_Section] = []
-    chapter_n = 0
-    section_n = 0
-    current_chapter = "Preface"
-
-    for i, entry in enumerate(toc):
-        title = entry["title"]
-        level = entry.get("level", 1)
-        char_offset = entry.get("char_offset")
-
-        if level == 1:
-            chapter_n += 1
-            section_n = 0
-            current_chapter = title
-
-        next_offset = None
-        if i + 1 < len(toc) and toc[i + 1].get("char_offset") is not None:
-            next_offset = toc[i + 1]["char_offset"]
-
-        if char_offset is not None:
-            chunk_text = text[char_offset:next_offset] if next_offset else text[char_offset:]
-            section_n += 1
-            sections.append(_Section(
-                title=title,
-                level=level,
-                text=chunk_text.strip(),
-                start_char=char_offset,
-                chapter_n=chapter_n,
-                section_n=section_n,
-                chapter_title=current_chapter,
-            ))
-
-    if not sections:
-        sections.append(_Section(
-            title="Full Text",
-            level=1,
-            text=text.strip(),
-            start_char=0,
-            chapter_n=1,
-            section_n=1,
-            chapter_title="Full Text",
-        ))
-    return sections
-
-
-def _sections_from_heuristics(text: str) -> list[_Section]:
-    boundaries: list[tuple[int, str, int]] = []  # (char_offset, heading_text, level)
-
-    for pattern in _CHAPTER_PATTERNS:
-        for m in pattern.finditer(text):
-            heading = text[m.start():text.find("\n", m.start())].strip()
-            boundaries.append((m.start(), heading, 1))
-    for pattern in _SECTION_PATTERNS:
-        for m in pattern.finditer(text):
-            heading = text[m.start():text.find("\n", m.start())].strip()
-            boundaries.append((m.start(), heading, 2))
-
-    boundaries.sort(key=lambda x: x[0])
-    if not boundaries:
-        return [_Section("Full Text", 1, text.strip(), 0, 1, 1, "Full Text")]
+    if not headings:
+        return [_Section(_DEFAULT_SECTION_TITLE, _DEFAULT_SECTION_TITLE, 1, 1, 0, text_len)]
 
     sections: list[_Section] = []
     chapter_n = 0
     section_n = 0
-    current_chapter = "Introduction"
+    chapter_title = ""
 
-    for i, (start, title, level) in enumerate(boundaries):
-        end = boundaries[i + 1][0] if i + 1 < len(boundaries) else len(text)
-        if level == 1:
-            chapter_n += 1
-            section_n = 0
-            current_chapter = title
-        section_n += 1
-        sections.append(_Section(
-            title=title,
-            level=level,
-            text=text[start:end].strip(),
-            start_char=start,
-            chapter_n=chapter_n,
-            section_n=section_n,
-            chapter_title=current_chapter,
-        ))
+    # Text before the first heading is real content (preface, epigraph) — keep it.
+    if headings[0].char_offset > 0:
+        sections.append(_Section("Front Matter", "Front Matter", 1, 1, 0, headings[0].char_offset))
+        chapter_n = 1
+        chapter_title = "Front Matter"
 
-    return sections
-
-
-def _split_into_paragraphs(
-    text: str,
-    max_chars: int,
-    overlap: int,
-) -> list[str]:
-    """Split `text` into chunks ≤ max_chars, respecting paragraph and sentence
-    boundaries. Overlap carries the last `overlap` characters from the prev chunk."""
-    raw_paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-
-    for para in raw_paras:
-        if current_len + len(para) + 1 > max_chars and current:
-            chunk_text = "\n\n".join(current)
-            chunks.append(chunk_text)
-            # overlap: keep last paragraph(s) whose total is ≤ overlap chars
-            tail: list[str] = []
-            tail_len = 0
-            for p in reversed(current):
-                if tail_len + len(p) <= overlap:
-                    tail.insert(0, p)
-                    tail_len += len(p)
-                else:
-                    break
-            current = tail
-            current_len = tail_len
-
-        current.append(para)
-        current_len += len(para) + 1
-
-    if current:
-        chunks.append("\n\n".join(current))
-
-    return [c for c in chunks if c.strip()]
-
-
-def build_chunks(
-    doc: ParsedDocument,
-    book_id: int,
-    user_id: str,
-) -> list[Chunk]:
-    """Convert a parsed document into a flat list of Chunk objects (no embeddings yet)."""
-    sections = _detect_sections(doc.raw_text, doc.native_toc)
-    logger.info("Detected %d sections for book_id=%d", len(sections), book_id)
-
-    chunks: list[Chunk] = []
-    global_seq = 0
-
-    for sec in sections:
-        if not sec.text:
+    for i, heading in enumerate(headings):
+        end = headings[i + 1].char_offset if i + 1 < len(headings) else text_len
+        if end <= heading.char_offset:
             continue
 
-        paras = _split_into_paragraphs(
-            sec.text,
-            settings.CHUNK_SIZE_CHARS,
-            settings.CHUNK_OVERLAP_CHARS,
+        if heading.level == 1:
+            chapter_n += 1
+            section_n = 1
+            chapter_title = heading.title
+        else:
+            if chapter_n == 0:  # a sub-heading before any chapter heading
+                chapter_n = 1
+                chapter_title = heading.title
+            section_n += 1
+
+        sections.append(
+            _Section(
+                title=heading.title,
+                chapter_title=chapter_title or heading.title,
+                chapter_n=chapter_n,
+                section_n=section_n,
+                start=heading.char_offset,
+                end=end,
+            )
         )
 
-        for para_n, para_text in enumerate(paras, start=1):
-            loc = ChunkLocation(
-                chapter_title=sec.chapter_title,
-                chapter_n=sec.chapter_n,
-                section_title=sec.title,
-                section_n=sec.section_n,
-                char_start=sec.start_char,
-                paragraph_n=para_n,
-            )
-            chunks.append(Chunk(
-                id=0,                   # assigned by DB on insert
-                book_id=book_id,
-                user_id=user_id,
-                text=para_text,
-                level=ChunkLevel.PARAGRAPH,
-                sequence=global_seq,
-                location=loc,
-                token_count=len(para_text) // 4,  # rough token estimate
-            ))
-            global_seq += 1
+    return sections
 
-    logger.info("Built %d chunks for book_id=%d", len(chunks), book_id)
+
+def _paragraph_spans(text: str, base: int) -> list[tuple[str, int, int]]:
+    """Paragraphs of `text` as (content, absolute_start, absolute_end)."""
+    spans: list[tuple[str, int, int]] = []
+    for match in _PARAGRAPH.finditer(text):
+        content = match.group().strip()
+        if content:
+            spans.append((content, base + match.start(), base + match.end()))
+    return spans
+
+
+def _pack(
+    paragraphs: list[tuple[str, int, int]],
+    max_chars: int,
+    overlap_chars: int,
+) -> list[tuple[str, int, int]]:
+    """Group paragraphs into chunks of ≤ max_chars with trailing-paragraph overlap."""
+    chunks: list[tuple[str, int, int]] = []
+    current: list[tuple[str, int, int]] = []
+    current_len = 0
+
+    def flush() -> None:
+        if current:
+            chunks.append(("\n\n".join(p[0] for p in current), current[0][1], current[-1][2]))
+
+    for para in paragraphs:
+        para_len = len(para[0])
+
+        # A single paragraph longer than the budget becomes its own chunk rather
+        # than being split mid-thought.
+        if para_len > max_chars:
+            flush()
+            chunks.append(para)
+            current, current_len = [], 0
+            continue
+
+        if current and current_len + para_len > max_chars:
+            flush()
+            tail: list[tuple[str, int, int]] = []
+            tail_len = 0
+            for prev in reversed(current):
+                if tail_len + len(prev[0]) > overlap_chars:
+                    break
+                tail.insert(0, prev)
+                tail_len += len(prev[0])
+            current, current_len = tail, tail_len
+
+        current.append(para)
+        current_len += para_len + 2
+
+    flush()
     return chunks
+
+
+def build_chunks(doc: ParsedDocument, book_id: int) -> list[Chunk]:
+    """Convert a parsed document into ordered chunks. Embeddings come later."""
+    sections = _build_sections(doc)
+    chunks: list[Chunk] = []
+    sequence = 0
+
+    for section in sections:
+        body = doc.raw_text[section.start : section.end]
+        paragraphs = _paragraph_spans(body, section.start)
+        if not paragraphs:
+            continue
+
+        packed = _pack(paragraphs, settings.CHUNK_SIZE_CHARS, settings.CHUNK_OVERLAP_CHARS)
+        for paragraph_n, (text, start, end) in enumerate(packed, start=1):
+            chunks.append(
+                Chunk(
+                    id=0,  # assigned by the database on insert
+                    book_id=book_id,
+                    text=text,
+                    sequence=sequence,
+                    location=ChunkLocation(
+                        chapter_title=section.chapter_title,
+                        chapter_n=section.chapter_n,
+                        section_title=section.title,
+                        section_n=section.section_n,
+                        char_start=start,
+                        char_end=end,
+                        page_start=doc.page_for_offset(start),
+                        page_end=doc.page_for_offset(end),
+                        paragraph_n=paragraph_n,
+                    ),
+                    token_count=len(text) // 4,  # rough, only used for reporting
+                )
+            )
+            sequence += 1
+
+    logger.info(
+        "Chunked book_id=%d: %d sections → %d chunks", book_id, len(sections), len(chunks)
+    )
+    return chunks
+
+
+def heading_outline(doc: ParsedDocument) -> list[Heading]:
+    """The document's headings, in reading order — used to build the stored ToC."""
+    return sorted(doc.headings, key=lambda h: h.char_offset)

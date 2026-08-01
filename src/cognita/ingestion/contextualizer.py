@@ -64,7 +64,7 @@ async def contextualize_chunks(
     """
     if not chunks:
         return []
-    if not settings.CONTEXT_ENABLED or not settings.ANTHROPIC_API_KEY:
+    if not settings.context_enabled:
         return ["" for _ in chunks]
 
     sections = _build_section_index(chunks)
@@ -74,11 +74,12 @@ async def contextualize_chunks(
 
     async def one(idx: int, chunk: Chunk) -> str:
         loc = chunk.location
+        surrounding = sections.get(_section_key(chunk), chunk.text)
         prefix = (
             f"<book>{by_line}</book>\n"
             f"<chapter>{loc.chapter_title or 'Unknown'}</chapter>\n"
             f"<section>{loc.section_title or 'Unknown'}</section>\n"
-            f"<surrounding_text>\n{sections.get(_section_key(chunk), chunk.text)}\n</surrounding_text>"
+            f"<surrounding_text>\n{surrounding}\n</surrounding_text>"
         )
         try:
             async with sem:
